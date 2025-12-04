@@ -71,13 +71,27 @@ function create_risk_classes(dataframe, target_col::String="Is Fraudulent")
     return data
 end
 
-function preprocess_multiclass(dataframe, target_col::String="Is Fraudulent")
+function preprocess_multiclass(dataframe, target_col::String="Is Fraudulent"; stats=nothing)
     """
-    Preprocess dataframe for multiclass fraud detection
+    Preprocess dataframe for multiclass fraud detection.
+    
+    Argomenti:
+        - dataframe: Il dataset da processare
+        - target_col: Nome della colonna target
+        - stats: (Opzionale) Dizionario con le statistiche calcolate sul training set.
+                 Se nothing, vengono calcolate sui dati correnti (modalità Training).
+    
+    Ritorna:
+        - Se stats è nothing: (processed_data, calculated_stats)
+        - Se stats è fornito: processed_data
     """
     data = copy(dataframe)
     
-    # Time features
+    # Se stats è nothing, siamo in fase di training: dobbiamo calcolare le statistiche
+    is_training = isnothing(stats)
+    new_stats = is_training ? Dict{String, Any}() : stats
+    
+    # 1. Time features (Nessuna statistica necessaria)
     if "Transaction Date" in names(data)
         try
             parsed_dates = DateTime.(data[!, "Transaction Date"], dateformat"y-m-d H:M:S")
@@ -88,20 +102,54 @@ function preprocess_multiclass(dataframe, target_col::String="Is Fraudulent")
         end
     end
     
-    # Imputation
+    # 2. Imputation (Median)
+    # Calcoliamo la mediana SOLO sul train e la riusiamo sul test
     for col in ["Transaction Amount", "Account Age Days"]
-        if col in names(data) && any(ismissing, data[!, col])
-            replace!(data[!, col], missing => median(skipmissing(data[!, col])))
+        if col in names(data)
+            # Determina il valore da usare
+            val_to_use = 0.0
+            
+            if is_training
+                # Modo Train: Calcola e salva
+                val_to_use = median(skipmissing(data[!, col]))
+                new_stats[col * "_median"] = val_to_use
+            else
+                # Modo Test: Usa valore salvato (se esiste, altrimenti ricalcola fallback)
+                if haskey(new_stats, col * "_median")
+                    val_to_use = new_stats[col * "_median"]
+                else
+                    val_to_use = median(skipmissing(data[!, col])) # Fallback
+                end
+            end
+            
+            # Applica imputazione
+            if any(ismissing, data[!, col])
+                replace!(data[!, col], missing => val_to_use)
+            end
         end
     end
     
-    # Feature engineering
+    # 3. Feature engineering
     if "Transaction Amount" in names(data) && "Account Age Days" in names(data)
         data.Amount_per_AccountAge = data[!, "Transaction Amount"] ./ (data[!, "Account Age Days"] .+ 1.0)
     end
     
+    # High_Value_Flag (95th percentile)
+    # CRITICO: Il quantile deve essere calcolato SOLO sul train
     if "Transaction Amount" in names(data)
-        p95 = quantile(data[!, "Transaction Amount"], 0.95)
+        p95 = 0.0
+        
+        if is_training
+            p95 = quantile(data[!, "Transaction Amount"], 0.95)
+            new_stats["amount_p95"] = p95
+        else
+            if haskey(new_stats, "amount_p95")
+                p95 = new_stats["amount_p95"]
+            else
+                p95 = quantile(data[!, "Transaction Amount"], 0.95)
+            end
+        end
+        
         data.High_Value_Flag = [amt > p95 ? 1.0 : 0.0 for amt in data[!, "Transaction Amount"]]
     end
     
@@ -117,7 +165,11 @@ function preprocess_multiclass(dataframe, target_col::String="Is Fraudulent")
                     "Device Used"]
     select!(data, Not(intersect(names(data), cols_to_drop)))
     
-    return data
+    # Ritorna i dati. Se eravamo in training, ritorna anche le statistiche.
+    if is_training
+        return data, new_stats
+    else
+        return data
+    end
 end
-
-end # module
+end# module

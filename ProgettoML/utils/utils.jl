@@ -846,7 +846,7 @@ function ANNCrossValidation(topology::AbstractArray{<:Int,1},
     f1_stats = (mean(fold_f1s), std(fold_f1s))
 
     # Return the tuple with all results
-    return (acc_stats, err_stats, sens_stats, spec_stats, ppv_stats, npv_stats, f1_stats, global_confusion_matrix)
+    return (acc_stats, err_stats, sens_stats, spec_stats, ppv_stats, npv_stats, f1_stats, global_confusion_matrix, fold_f1s)
 end
 
 
@@ -1006,7 +1006,7 @@ function ANNCrossValidation(topology::AbstractArray{<:Int,1},
     f1_stats = (mean(fold_f1s), std(fold_f1s))
 
     # Return the tuple with all results
-    return (acc_stats, err_stats, sens_stats, spec_stats, ppv_stats, npv_stats, f1_stats, global_confusion_matrix)
+    return (acc_stats, err_stats, sens_stats, spec_stats, ppv_stats, npv_stats, f1_stats, global_confusion_matrix, fold_f1s)
 end
 
 
@@ -1179,7 +1179,7 @@ function modelCrossValidation(
     f1_stats = (mean(f1s), std(f1s))
     
     # 7. Return the 8-tuple as specified
-    return (acc_stats, err_stats, sens_stats, spec_stats, ppv_stats, npv_stats, f1_stats, globalConfusionMatrix)
+    return (acc_stats, err_stats, sens_stats, spec_stats, ppv_stats, npv_stats, f1_stats, globalConfusionMatrix, f1s)
 end
 
 # ============================================================================
@@ -1330,7 +1330,8 @@ function modelCrossValidation(
         (mean(ppvs), std(ppvs)),
         (mean(npvs), std(npvs)),
         (mean(f1s), std(f1s)),
-        globalConfusionMatrix
+        globalConfusionMatrix,
+        f1s
     )
 end
 

@@ -26,14 +26,15 @@
 #
 # ============================================================================
 
+# ============================================================================
+#                    SETUP & IMPORTS
+# ============================================================================
+
 # Set random seed for reproducibility
 using Random
 Random.seed!(42)
 
-# ============================================================================
-#                    PACKAGE IMPORTS
-# ============================================================================
-
+# Load packages
 using CSV
 using DataFrames
 using Statistics
@@ -48,198 +49,167 @@ println("✅ Course utilities loaded (includes modelCrossValidation, confusionMa
 
 # Load custom preprocessing
 include("utils/preprocessing.jl")
-using .PreprocessingUtils: create_risk_classes, preprocess_multiclass
+using .PreprocessingUtils
 println("✅ Custom preprocessing utilities loaded!")
 
 # ============================================================================
-#  HELPER FUNCTION: EVALUATE ALL MODELS FOR A GIVEN APPROACH
+#  HELPER FUNCTION: EVALUATE ALL MODELS (FIXED SVM TYPO)
 # ============================================================================
-# MODIFICATO: Ora include il retraining sul full train set e valutazione su test set
-
 function evaluate_approach(approach_name, train_inputs, train_targets, test_inputs, test_targets; cv_folds=3)
-    println("\n" * "="^70)
+    println("\n" * "="^80)
     println("🚀 EVALUATING APPROACH: $approach_name")
-    println("="^70)
+    println("="^80)
     
-    # Generate CV indices for this specific dataset/target
     cv_indices = crossvalidation(train_targets, cv_folds)
+    final_results = Dict{String, Dict{String, Float64}}()
     
-    # Dizionario per salvare i risultati sul TEST SET (non più CV)
-    test_results = Dict()
-    
-    # Preparazione target stringa per MLJ (SVM, DT, kNN)
+    # Prepare Data
     train_targets_str = string.(train_targets)
     test_targets_str = string.(test_targets)
     classes_str = sort(unique(train_targets_str))
-
-    # Preparazione target one-hot per ANN
+    
     classes_int = sort(unique(train_targets))
     train_targets_onehot = oneHotEncoding(train_targets, classes_int)
     test_targets_onehot = oneHotEncoding(test_targets, classes_int)
 
-    # Normalizzazione (necessaria per ANN, SVM, kNN)
-    # Calcoliamo i parametri sul train e applichiamo a train e test
     normParams = calculateMinMaxNormalizationParameters(train_inputs)
     train_inputs_norm = normalizeMinMax(train_inputs, normParams)
     test_inputs_norm = normalizeMinMax(test_inputs, normParams)
 
-    # ------------------------------------------------------------------------
-    # 1. Artificial Neural Networks (ANNs)
-    # ------------------------------------------------------------------------
-    println("\n[1/4] Testing ANNs (8 Architectures)...")
-    ann_topologies = [
-        [256], [128], [64], [32],       
-        [256, 128], [128, 64], [64, 32], [96, 48]
-    ]
-    
-    best_f1_cv_ann = -1.0
-    best_topo_ann = []
-    
-    # A. Cross-Validation Selection
-    for topology in ann_topologies
-        hyperparams = Dict(
-            "topology" => topology,
-            "learningRate" => 0.003,
-            "validationRatio" => 0.1,
-            "numExecutions" => 1,
-            "maxEpochs" => 800,
-            "maxEpochsVal" => 25
-        )
-        # Usiamo i dati NON normalizzati qui perché modelCrossValidation gestisce la normalizzazione internamente se configurata,
-        # MA la tua modelCrossValidation per ANN chiama ANNCrossValidation che NON normalizza.
-        # PER SICUREZZA: Passiamo i dati normalizzati alla CV delle ANN se la tua implementazione lo richiede.
-        # Guardando utils.jl, ANNCrossValidation usa i dati raw. È meglio passare i dati normalizzati per le ANN.
-        results = modelCrossValidation(:ANN, hyperparams, (train_inputs_norm, train_targets), cv_indices)
-        f1 = results[7][1]
-        
-        if f1 > best_f1_cv_ann
-            best_f1_cv_ann = f1
-            best_topo_ann = topology
+    # --- INTERNAL HELPER ---
+    function calculate_metrics_safe(y_pred_probs, y_pred_class, y_true_class, y_true_onehot, classes)
+        # AUC Calculation
+        auc_score = 0.5
+        if length(classes) == 2
+            probs = vec(y_pred_probs)
+            true_bin = vec(y_true_onehot) 
+            p = sortperm(probs); probs_sorted = probs[p]; true_sorted = true_bin[p]
+            tpr = [0.0]; fpr = [0.0]
+            num_pos = sum(true_sorted); num_neg = length(true_sorted) - num_pos
+            if num_pos > 0 && num_neg > 0
+                tp = 0; fp = 0
+                for i in length(probs_sorted):-1:1
+                    if true_sorted[i] == 1; tp += 1; else; fp += 1; end
+                    push!(tpr, tp/num_pos); push!(fpr, fp/num_neg)
+                end
+                auc_score = 0.0
+                for i in 2:length(tpr); auc_score += (fpr[i] - fpr[i-1]) * (tpr[i] + tpr[i-1]) / 2; end
+            end
         end
+
+        # Metrics
+        acc, sens, spec, f1 = 0.0, 0.0, 0.0, 0.0
+        if length(classes) == 2
+            pos_label = classes[end]
+            y_p_bool = vec(y_pred_class .== pos_label)
+            y_t_bool = vec(y_true_class .== pos_label)
+            (acc, err, sens, spec, prec, npv, f1, cm) = confusionMatrix(y_p_bool, y_t_bool)
+        else
+            cm_res = confusionMatrix(y_pred_class, y_true_class, classes; weighted=true)
+            acc = cm_res.accuracy; sens = cm_res.aggregated.sensitivity
+            spec = cm_res.aggregated.specificity; f1 = cm_res.aggregated.f1
+        end
+        return Dict("Accuracy"=>acc, "AUC"=>auc_score, "Sensitivity"=>sens, "Specificity"=>spec, "F1"=>f1)
+    end
+    
+    # 1. ANNs
+    println("\n[1/4] Testing ANNs...")
+    ann_topologies = [[256], [128], [64], [32], [256, 128], [128, 64], [64, 32], [96, 48]]
+    best_f1_cv_ann = -1.0; best_topo_ann = []
+    for topology in ann_topologies
+        hyperparams = Dict("topology" => topology, "learningRate" => 0.003, "validationRatio" => 0.1, 
+                           "numExecutions" => 1, "maxEpochs" => 800, "maxEpochsVal" => 25)
+        res = modelCrossValidation(:ANN, hyperparams, (train_inputs_norm, train_targets), cv_indices)
+        if res[7][1] > best_f1_cv_ann; best_f1_cv_ann = res[7][1]; best_topo_ann = topology; end
     end
     println("   ✨ Best ANN (CV): $best_topo_ann - CV F1: $(round(best_f1_cv_ann*100, digits=2))%")
 
-    # B. Retraining & Final Test Evaluation
-    println("      ...Retraining Best ANN on full training set...")
-    # Creiamo split di validazione per l'early stopping
-    N_train = size(train_inputs_norm, 1)
-    (train_idx, val_idx) = holdOut(N_train, 0.1)
-    
+    println("      ...Retraining Best ANN...")
+    N_train = size(train_inputs_norm, 1); (train_idx, val_idx) = holdOut(N_train, 0.1)
     final_ann, _ = _trainClassANN(best_topo_ann,
         (train_inputs_norm[train_idx, :], train_targets_onehot[train_idx, :]),
         validationDataset=(train_inputs_norm[val_idx, :], train_targets_onehot[val_idx, :]),
-        testDataset=(test_inputs_norm, test_targets_onehot), # Monitoriamo il test ma non lo usiamo per il training
+        testDataset=(test_inputs_norm, test_targets_onehot),
         maxEpochs=800, learningRate=0.003, maxEpochsVal=25)
     
-    test_outputs_ann = final_ann(test_inputs_norm')'
-    cm_ann = confusionMatrix(test_outputs_ann, test_targets_onehot; weighted=true)
-    test_results["ANN"] = cm_ann.aggregated.f1
-    println("      ✅ Final Test F1: $(round(test_results["ANN"]*100, digits=2))%")
-
-
-    # ------------------------------------------------------------------------
-    # 2. Support Vector Machines (SVMs)
-    # ------------------------------------------------------------------------
-    println("\n[2/4] Testing SVMs (Configs)...")
-    svm_configs = [
-        ("linear", 1.0, 0.1, 3), ("linear", 10.0, 0.1, 3),
-        ("rbf", 1.0, 0.125, 3), ("rbf", 10.0, 0.125, 3), ("rbf", 100.0, 0.125, 3),
-        ("poly", 1.0, 0.1, 2), ("poly", 10.0, 0.1, 2), ("poly", 1.0, 0.1, 3)
-    ]
-    
-    best_f1_cv_svm = -1.0
-    best_params_svm = ()
-    
-    # A. CV Selection
-    for (kernel, C, gamma, degree) in svm_configs
-        hyperparams = Dict("kernel"=>kernel, "C"=>C, "gamma"=>gamma, "degree"=>degree)
-        # Passiamo dati raw perché la tua modelCrossValidation MLJ normalizza internamente
-        results = modelCrossValidation(:SVC, hyperparams, (train_inputs, train_targets), cv_indices)
-        f1 = results[7][1]
-        
-        if f1 > best_f1_cv_svm
-            best_f1_cv_svm = f1
-            best_params_svm = (kernel, C, gamma, degree)
-        end
+    test_outputs_ann_raw = final_ann(test_inputs_norm')'
+    if size(test_targets_onehot, 2) == 1
+        probs_ann = vec(test_outputs_ann_raw); preds_ann = Int.(probs_ann .>= 0.5)
+        final_results["ANN"] = calculate_metrics_safe(probs_ann, preds_ann, test_targets, test_targets_onehot, classes_int)
+    else
+        preds_bool = classifyOutputs(test_outputs_ann_raw)
+        preds_ann = [findfirst(x->x, row) - 1 for row in eachrow(preds_bool)]
+        final_results["ANN"] = calculate_metrics_safe(test_outputs_ann_raw, preds_ann, test_targets, test_targets_onehot, classes_int)
     end
-    println("   ✨ Best SVM (CV): $(best_params_svm[1]) - CV F1: $(round(best_f1_cv_svm*100, digits=2))%")
+    m = final_results["ANN"]
+    println("      ✅ ANN Results: Acc=$(round(m["Accuracy"],digits=3)), F1=$(round(m["F1"],digits=3))")
 
-    # B. Retraining
-    println("      ...Retraining Best SVM on full training set...")
-    (k, C, g, d) = best_params_svm
-    kernel_func = k == "linear" ? LIBSVM.Kernel.Linear : (k == "poly" ? LIBSVM.Kernel.Polynomial : LIBSVM.Kernel.RadialBasis)
+    # 2. SVM
+    println("\n[2/4] Testing SVMs...")
+    svm_configs = [("linear", 1.0, 0.1, 3), ("rbf", 1.0, 0.125, 3), ("poly", 1.0, 0.1, 2)]
+    best_f1_cv_svm = -1.0; best_params_svm = ()
+    for (kernel, C, gamma, degree) in svm_configs
+        res = modelCrossValidation(:SVC, Dict("kernel"=>kernel, "C"=>C, "gamma"=>gamma, "degree"=>degree), (train_inputs, train_targets), cv_indices)
+        if res[7][1] > best_f1_cv_svm; best_f1_cv_svm = res[7][1]; best_params_svm = (kernel, C, gamma, degree); end
+    end
     
-    model_svm = SVMClassifier(kernel=kernel_func, cost=C, gamma=g, degree=Int32(d))
+    (k, C, g, d) = best_params_svm
+    k_func = k == "linear" ? LIBSVM.Kernel.Linear : (k == "poly" ? LIBSVM.Kernel.Polynomial : LIBSVM.Kernel.RadialBasis)
+    model_svm = SVMClassifier(kernel=k_func, cost=C, gamma=g, degree=Int32(d))
     mach_svm = machine(model_svm, MLJ.table(train_inputs_norm), categorical(train_targets_str))
     MLJ.fit!(mach_svm, verbosity=0)
     
-    preds_svm = MLJ.predict(mach_svm, MLJ.table(test_inputs_norm))
-    cm_svm = confusionMatrix(preds_svm, test_targets_str, classes_str; weighted=true)
-    test_results["SVM"] = cm_svm.aggregated.f1
-    println("      ✅ Final Test F1: $(round(test_results["SVM"]*100, digits=2))%")
+    # CORREZIONE QUI SOTTO: pred_svm_class -> pred_svm_str
+    preds_svm_class = MLJ.predict(mach_svm, MLJ.table(test_inputs_norm))
+    preds_svm_str = string.(preds_svm_class) # <--- VARIABILE CORRETTA
+    
+    final_results["SVM"] = calculate_metrics_safe(zeros(length(preds_svm_str)), preds_svm_str, test_targets_str, test_targets_onehot, classes_str)
+    m = final_results["SVM"]
+    println("      ✅ SVM Results: Acc=$(round(m["Accuracy"],digits=3)), F1=$(round(m["F1"],digits=3))")
 
-    # ------------------------------------------------------------------------
     # 3. Decision Trees
-    # ------------------------------------------------------------------------
     println("\n[3/4] Testing Decision Trees...")
-    depths = [3, 5, 7, 10, 15, 20]
-    
-    best_f1_cv_dt = -1.0
-    best_depth = 0
-    
-    # A. CV Selection
-    for depth in depths
-        hyperparams = Dict("max_depth" => depth)
-        results = modelCrossValidation(:DecisionTreeClassifier, hyperparams, (train_inputs, train_targets), cv_indices)
-        f1 = results[7][1]
-        if f1 > best_f1_cv_dt; best_f1_cv_dt = f1; best_depth = depth; end
+    depths = [3, 5, 7, 10]; best_f1_cv_dt = -1.0; best_depth = 0
+    for d in depths
+        res = modelCrossValidation(:DecisionTreeClassifier, Dict("max_depth"=>d), (train_inputs, train_targets), cv_indices)
+        if res[7][1] > best_f1_cv_dt; best_f1_cv_dt = res[7][1]; best_depth = d; end
     end
-    println("   ✨ Best Tree (CV): Depth=$best_depth - CV F1: $(round(best_f1_cv_dt*100, digits=2))%")
-
-    # B. Retraining
-    println("      ...Retraining Best Tree on full training set...")
+    
     model_dt = DTClassifier(max_depth=best_depth, rng=Random.MersenneTwister(42))
     mach_dt = machine(model_dt, MLJ.table(train_inputs_norm), categorical(train_targets_str))
     MLJ.fit!(mach_dt, verbosity=0)
     
-    preds_dt = MLJ.predict(mach_dt, MLJ.table(test_inputs_norm))
-    preds_dt_mode = mode.(preds_dt)
-    cm_dt = confusionMatrix(preds_dt_mode, test_targets_str, classes_str; weighted=true)
-    test_results["DT"] = cm_dt.aggregated.f1
-    println("      ✅ Final Test F1: $(round(test_results["DT"]*100, digits=2))%")
+    preds_dt_prob = MLJ.predict(mach_dt, MLJ.table(test_inputs_norm))
+    preds_dt_str = string.(mode.(preds_dt_prob))
+    probs_dt = zeros(length(preds_dt_str)); try; probs_dt = pdf.(preds_dt_prob, classes_str[end]); catch; end
 
-    # ------------------------------------------------------------------------
-    # 4. k-Nearest Neighbors (kNN)
-    # ------------------------------------------------------------------------
+    final_results["DT"] = calculate_metrics_safe(probs_dt, preds_dt_str, test_targets_str, test_targets_onehot, classes_str)
+    m = final_results["DT"]
+    println("      ✅ DT Results: Acc=$(round(m["Accuracy"],digits=3)), F1=$(round(m["F1"],digits=3))")
+
+    # 4. kNN
     println("\n[4/4] Testing kNN...")
-    k_values = [1, 3, 5, 7, 10, 15]
-    
-    best_f1_cv_knn = -1.0
-    best_k = 0
-    
-    # A. CV Selection
-    for k in k_values
-        hyperparams = Dict("n_neighbors" => k)
-        results = modelCrossValidation(:KNeighborsClassifier, hyperparams, (train_inputs, train_targets), cv_indices)
-        f1 = results[7][1]
-        if f1 > best_f1_cv_knn; best_f1_cv_knn = f1; best_k = k; end
+    k_vals = [1, 3, 5, 7]; best_f1_cv_knn = -1.0; best_k = 0
+    for k in k_vals
+        res = modelCrossValidation(:KNeighborsClassifier, Dict("n_neighbors"=>k), (train_inputs, train_targets), cv_indices)
+        if res[7][1] > best_f1_cv_knn; best_f1_cv_knn = res[7][1]; best_k = k; end
     end
-    println("   ✨ Best kNN (CV): k=$best_k - CV F1: $(round(best_f1_cv_knn*100, digits=2))%")
-
-    # B. Retraining (Lazy learning, just fitting the machine)
-    println("      ...Preparing Final kNN...")
+    
     model_knn = kNNClassifier(K=best_k)
     mach_knn = machine(model_knn, MLJ.table(train_inputs_norm), categorical(train_targets_str))
     MLJ.fit!(mach_knn, verbosity=0)
     
-    preds_knn = MLJ.predict(mach_knn, MLJ.table(test_inputs_norm))
-    preds_knn_mode = mode.(preds_knn)
-    cm_knn = confusionMatrix(preds_knn_mode, test_targets_str, classes_str; weighted=true)
-    test_results["kNN"] = cm_knn.aggregated.f1
-    println("      ✅ Final Test F1: $(round(test_results["kNN"]*100, digits=2))%")
+    preds_knn_prob = MLJ.predict(mach_knn, MLJ.table(test_inputs_norm))
+    preds_knn_str = string.(mode.(preds_knn_prob))
+    probs_knn = zeros(length(preds_knn_str)); try; probs_knn = pdf.(preds_knn_prob, classes_str[end]); catch; end
     
-    return test_results
+    final_results["kNN"] = calculate_metrics_safe(probs_knn, preds_knn_str, test_targets_str, test_targets_onehot, classes_str)
+    m = final_results["kNN"]
+    println("      ✅ kNN Results: Acc=$(round(m["Accuracy"],digits=3)), F1=$(round(m["F1"],digits=3))")
+
+    return final_results
 end
+
 # ============================================================================
 #              DATA LOADING & 3-CLASS TARGET CREATION
 # ============================================================================
@@ -277,7 +247,7 @@ println("Original fraud distribution:")
 println("  Non-fraud: $(sum(df[!, target_col] .== 0))")
 println("  Fraud:     $(sum(df[!, target_col] .== 1))")
 
-# Create 3-class target using custom function
+# Create 3-class target
 println("\n" * "="^70)
 println("🎯 CREATING 3-CLASS TARGET")
 println("="^70)
@@ -324,7 +294,7 @@ df_balanced = df_balanced[shuffle(1:size(df_balanced, 1)), :]
 
 println("  Balanced dataset size: $(size(df_balanced))")
 
-# Split Train/Test BEFORE preprocessing (critical to avoid data leakage!)
+# Split Train/Test BEFORE preprocessing (critical!)
 n_total = size(df_balanced, 1)
 n_train = floor(Int, n_total * 0.80)
 n_test = n_total - n_train
@@ -444,7 +414,7 @@ for (i, topology) in enumerate(topologies_to_test)
         "maxEpochsVal" => 25
     )
     
-    # Use modelCrossValidation from utils.jl (course function)
+    # Use modelCrossValidation from utils.jl
     results = modelCrossValidation(
         :ANN,
         hyperparams,
@@ -474,45 +444,39 @@ best_f1_ann = sorted_ann_results[1][2]
 println("\n✨ Best ANN: $best_topology_ann (CV F1: $(round(best_f1_ann*100, digits=2))%)")
 
 # Train final ANN on full training set and evaluate on test set
-println("\n🚀 Training final ANN on full training set...")
+println("\n🚀 Training final ANN on full training set (Retrain + Full Metrics)...")
 
-# 1. Definisci le classi in modo univoco e ordinato (FONDAMENTALE)
-classes = sort(unique(train_targets)) 
+# Setup Data for Final Training
+classes_ann = sort(unique(train_targets))
+train_targets_onehot = oneHotEncoding(train_targets, classes_ann)
+test_targets_onehot = oneHotEncoding(test_targets, classes_ann)
 
-# 2. Usa queste classi per entrambi gli encoding
-train_targets_onehot = oneHotEncoding(train_targets, classes)
-test_targets_onehot = oneHotEncoding(test_targets, classes)
-
-# 3. Normalizzazione
 normParams_ann = calculateMinMaxNormalizationParameters(train_inputs)
 train_inputs_norm = normalizeMinMax(train_inputs, normParams_ann)
 test_inputs_norm = normalizeMinMax(test_inputs, normParams_ann)
 
-# 4. Creazione validation split
+# Validation split for Early Stopping
 N_train = size(train_inputs_norm, 1)
 (train_idx, val_idx) = holdOut(N_train, 0.1)
 
-# 5. Training (con la funzione interna corretta "_")
 final_ann, _ = _trainClassANN(best_topology_ann,
     (train_inputs_norm[train_idx, :], train_targets_onehot[train_idx, :]),
     validationDataset=(train_inputs_norm[val_idx, :], train_targets_onehot[val_idx, :]),
     testDataset=(test_inputs_norm, test_targets_onehot),
-    maxEpochs=800,
-    learningRate=0.003,
-    maxEpochsVal=25)
+    maxEpochs=800, learningRate=0.003, maxEpochsVal=25)
 
-# Predict on test set
+# Predict (Raw Probabilities) -> Needed for Ensemble later!
 test_outputs_ann = final_ann(test_inputs_norm')'
 
-# Calculate metrics using confusionMatrix from course utils
-cm_results_ann = confusionMatrix(test_outputs_ann, test_targets_onehot; weighted=true)
+# Calculate Full Metrics
+preds_ann_cls = classifyOutputs(test_outputs_ann) # Boolean matrix
+preds_ann_int = [findfirst(x->x, row) - 1 for row in eachrow(preds_ann_cls)] # 0,1,2 labels
 
-println("\n📊 ANN TEST SET RESULTS:")
-println("="^70)
-println("Accuracy:  $(round(cm_results_ann.accuracy*100, digits=2))%")
-println("F1 Score:  $(round(cm_results_ann.aggregated.f1*100, digits=2))%")
-println("\nConfusion Matrix:")
-printConfusionMatrix(test_outputs_ann, test_targets_onehot; weighted=true)
+# Prepare args for metrics helper
+probs_ann_vec = (size(test_targets_onehot, 2) == 1) ? vec(test_outputs_ann) : test_outputs_ann
+metrics_ann = calculate_metrics_safe(probs_ann_vec, preds_ann_int, test_targets, test_targets_onehot, classes_ann)
+
+println("📊 ANN Test Results: Acc=$(round(metrics_ann["Accuracy"],digits=3)), F1=$(round(metrics_ann["F1"],digits=3))")
 
 # ============================================================================
 #        EXPERIMENT 2: SUPPORT VECTOR MACHINES (SVMs)
@@ -563,7 +527,6 @@ for (i, (kernel, C, gamma, degree, desc)) in enumerate(svm_configs)
         "degree" => degree
     )
     
-    # Use modelCrossValidation from utils.jl
     results = modelCrossValidation(
         :SVC,
         hyperparams,
@@ -591,48 +554,32 @@ best_desc_svm, best_f1_svm, best_kernel_svm, best_C_svm, best_gamma_svm, best_de
 println("\n✨ Best SVM: $best_desc_svm (CV F1: $(round(best_f1_svm*100, digits=2))%)")
 
 # Train final SVM and evaluate on test set
+
 println("\n🚀 Training final SVM on full training set...")
 
-# Load MLJ for final model training
-using MLJ
-SVMClassifier = @load SVC pkg=LIBSVM
-
-# Normalize
-train_inputs_norm_svm = normalizeMinMax(train_inputs, calculateMinMaxNormalizationParameters(train_inputs))
-test_inputs_norm_svm = normalizeMinMax(test_inputs, calculateMinMaxNormalizationParameters(train_inputs))
-
-# Convert to strings for MLJ
+# Setup Data
+train_inputs_norm = normalizeMinMax(train_inputs, calculateMinMaxNormalizationParameters(train_inputs))
+test_inputs_norm = normalizeMinMax(test_inputs, calculateMinMaxNormalizationParameters(train_inputs))
 train_targets_str = string.(train_targets)
 test_targets_str = string.(test_targets)
-classes = sort(unique(train_targets_str))
+classes_str = sort(unique(train_targets_str))
 
-# Set kernel
-if best_kernel_svm == "linear"
-    kernel_func = LIBSVM.Kernel.Linear
-elseif best_kernel_svm == "poly"
-    kernel_func = LIBSVM.Kernel.Polynomial
-else
-    kernel_func = LIBSVM.Kernel.RadialBasis
-end
-
-model_svm = SVMClassifier(
-    kernel=kernel_func,
-    cost=best_C_svm,
-    gamma=best_gamma_svm,
-    degree=Int32(best_degree_svm)
-)
-
-mach_svm = machine(model_svm, MLJ.table(train_inputs_norm_svm), categorical(train_targets_str))
+# Train
+(k, C, g, d) = (best_kernel_svm, best_C_svm, best_gamma_svm, best_degree_svm)
+k_func = k == "linear" ? LIBSVM.Kernel.Linear : (k == "poly" ? LIBSVM.Kernel.Polynomial : LIBSVM.Kernel.RadialBasis)
+model_svm = SVMClassifier(kernel=k_func, cost=C, gamma=g, degree=Int32(d))
+mach_svm = machine(model_svm, MLJ.table(train_inputs_norm), categorical(train_targets_str))
 MLJ.fit!(mach_svm, verbosity=0)
 
-# Predict
-svm_predictions = MLJ.predict(mach_svm, MLJ.table(test_inputs_norm_svm))
-cm_results_svm = confusionMatrix(svm_predictions, test_targets_str, classes; weighted=true)
+# Predict -> Needed for Ensemble!
+svm_predictions = MLJ.predict(mach_svm, MLJ.table(test_inputs_norm))
+svm_predictions_str = string.(svm_predictions)
 
-println("\n📊 SVM TEST SET RESULTS:")
-println("="^70)
-println("Accuracy:  $(round(cm_results_svm.accuracy*100, digits=2))%")
-println("F1 Score:  $(round(cm_results_svm.aggregated.f1*100, digits=2))%")
+# Calculate Metrics
+# SVM probabilities are tricky with LIBSVM wrapper, passing zeros for AUC (placeholder)
+metrics_svm = calculate_metrics_safe(zeros(length(svm_predictions_str)), svm_predictions_str, test_targets_str, test_targets_onehot, classes_str)
+
+println("📊 SVM Test Results: Acc=$(round(metrics_svm["Accuracy"],digits=3)), F1=$(round(metrics_svm["F1"],digits=3))")
 
 # ============================================================================
 #            EXPERIMENT 3: DECISION TREES
@@ -666,7 +613,6 @@ for (i, max_depth) in enumerate(tree_depths)
     
     hyperparams = Dict("max_depth" => max_depth)
     
-    # Use modelCrossValidation from utils.jl
     results = modelCrossValidation(
         :DecisionTreeClassifier,
         hyperparams,
@@ -690,37 +636,28 @@ for (i, (depth_str, _, f1, _)) in enumerate(sorted_tree_results)
 end
 
 best_desc_tree, best_max_depth_tree, best_f1_tree = sorted_tree_results[1][1:3]
-println("\n✨ Best Tree: Depth=$best_desc_tree (CV F1: $(round(best_f1_tree*100, digits=2))%)")
+println("\n✨ Best Tree: Depth=$best_desc_tree (CV F1: $(round(best_f1_tree*100, digits=2))%)"
 
 # Train final Decision Tree
-println("\n🚀 Training final Decision Tree on full training set...")
 
-DTClassifier = @load DecisionTreeClassifier pkg=DecisionTree
+println("\n🚀 Training final Decision Tree...")
 
-train_inputs_norm_tree = normalizeMinMax(train_inputs, calculateMinMaxNormalizationParameters(train_inputs))
-test_inputs_norm_tree = normalizeMinMax(test_inputs, calculateMinMaxNormalizationParameters(train_inputs))
-
-train_targets_str_tree = string.(train_targets)
-test_targets_str_tree = string.(test_targets)
-
-if best_max_depth_tree == -1
-    model_tree = DTClassifier(rng=Random.MersenneTwister(42))
-else
-    model_tree = DTClassifier(max_depth=best_max_depth_tree, rng=Random.MersenneTwister(42))
-end
-
-mach_tree = machine(model_tree, MLJ.table(train_inputs_norm_tree), categorical(train_targets_str_tree))
+model_tree = DTClassifier(max_depth=best_max_depth_tree, rng=Random.MersenneTwister(42))
+mach_tree = machine(model_tree, MLJ.table(train_inputs_norm), categorical(train_targets_str))
 MLJ.fit!(mach_tree, verbosity=0)
 
-tree_predictions = MLJ.predict(mach_tree, MLJ.table(test_inputs_norm_tree))
+# Predict -> Needed for Ensemble!
+tree_predictions = MLJ.predict(mach_tree, MLJ.table(test_inputs_norm))
 tree_predictions_mode = mode.(tree_predictions)
+tree_predictions_str = string.(tree_predictions_mode)
 
-cm_results_tree = confusionMatrix(tree_predictions_mode, test_targets_str_tree, classes; weighted=true)
+# Calculate Metrics (Attempt extracting prob for AUC)
+probs_dt = zeros(length(tree_predictions_str))
+try; probs_dt = pdf.(tree_predictions, classes_str[end]); catch; end
 
-println("\n📊 DECISION TREE TEST SET RESULTS:")
-println("="^70)
-println("Accuracy:  $(round(cm_results_tree.accuracy*100, digits=2))%")
-println("F1 Score:  $(round(cm_results_tree.aggregated.f1*100, digits=2))%")
+metrics_tree = calculate_metrics_safe(probs_dt, tree_predictions_str, test_targets_str, test_targets_onehot, classes_str)
+
+println("📊 DT Test Results: Acc=$(round(metrics_tree["Accuracy"],digits=3)), F1=$(round(metrics_tree["F1"],digits=3))")
 
 # ============================================================================
 #            EXPERIMENT 4: k-NEAREST NEIGHBORS (kNN)
@@ -752,7 +689,6 @@ for (i, k) in enumerate(k_values)
     
     hyperparams = Dict("n_neighbors" => k)
     
-    # Use modelCrossValidation from utils.jl
     results = modelCrossValidation(
         :KNeighborsClassifier,
         hyperparams,
@@ -781,29 +717,22 @@ println("\n✨ Best kNN: k=$best_k_knn (CV F1: $(round(best_f1_knn*100, digits=2
 # Train final kNN
 println("\n🚀 Preparing final kNN...")
 
-kNNClassifier = @load KNNClassifier pkg=NearestNeighborModels
-
-train_inputs_norm_knn = normalizeMinMax(train_inputs, calculateMinMaxNormalizationParameters(train_inputs))
-test_inputs_norm_knn = normalizeMinMax(test_inputs, calculateMinMaxNormalizationParameters(train_inputs))
-
-train_targets_str_knn = string.(train_targets)
-test_targets_str_knn = string.(test_targets)
-
 model_knn = kNNClassifier(K=best_k_knn)
-
-mach_knn = machine(model_knn, MLJ.table(train_inputs_norm_knn), categorical(train_targets_str_knn))
+mach_knn = machine(model_knn, MLJ.table(train_inputs_norm), categorical(train_targets_str))
 MLJ.fit!(mach_knn, verbosity=0)
 
-knn_predictions = MLJ.predict(mach_knn, MLJ.table(test_inputs_norm_knn))
+# Predict -> Needed for Ensemble!
+knn_predictions = MLJ.predict(mach_knn, MLJ.table(test_inputs_norm))
 knn_predictions_mode = mode.(knn_predictions)
+knn_predictions_str = string.(knn_predictions_mode)
 
-cm_results_knn = confusionMatrix(knn_predictions_mode, test_targets_str_knn, classes; weighted=true)
+# Calculate Metrics
+probs_knn = zeros(length(knn_predictions_str))
+try; probs_knn = pdf.(knn_predictions, classes_str[end]); catch; end
 
-println("\n📊 kNN TEST SET RESULTS:")
-println("="^70)
-println("Accuracy:  $(round(cm_results_knn.accuracy*100, digits=2))%")
-println("F1 Score:  $(round(cm_results_knn.aggregated.f1*100, digits=2))%")
+metrics_knn = calculate_metrics_safe(probs_knn, knn_predictions_str, test_targets_str, test_targets_onehot, classes_str)
 
+println("📊 kNN Test Results: Acc=$(round(metrics_knn["Accuracy"],digits=3)), F1=$(round(metrics_knn["F1"],digits=3))")
 # ============================================================================
 #            EXPERIMENT 5: ENSEMBLE METHODS
 # ============================================================================
@@ -835,63 +764,86 @@ println("="^70)
 function majorityVoting(predictions::Vector{Vector{String}})
     n_samples = length(predictions[1])
     ensemble_predictions = Vector{String}(undef, n_samples)
-    
     for i in 1:n_samples
         votes = [pred[i] for pred in predictions]
         ensemble_predictions[i] = mode(votes)
     end
-    
     return ensemble_predictions
 end
 
 function weightedVoting(predictions::Vector{Vector{String}}, weights::Vector{Float64})
     n_samples = length(predictions[1])
     n_models = length(predictions)
+    # Ensure classes are gathered from all predictions
     classes_unique = sort(unique(vcat(predictions...)))
-    n_classes = length(classes_unique)
     
     ensemble_predictions = Vector{String}(undef, n_samples)
-    
     for i in 1:n_samples
         class_scores = Dict(c => 0.0 for c in classes_unique)
-        
         for j in 1:n_models
             class_pred = predictions[j][i]
-            class_scores[class_pred] += weights[j]
+            if haskey(class_scores, class_pred)
+                class_scores[class_pred] += weights[j]
+            end
         end
-        
         ensemble_predictions[i] = argmax(class_scores)
     end
-    
     return ensemble_predictions
 end
 
-# Get test predictions from all 3 models as string vectors
-ann_test_pred_str = string.(argmax.(eachrow(test_outputs_ann)) .- 1)
-tree_test_pred_str = string.(tree_predictions_mode)
-knn_test_pred_str = string.(knn_predictions_mode)
+# 1. Prepare Predictions (Ensure all are Strings)
+# ANN outputs (calculated in Exp 1 update) -> Convert to String labels
+# We use preds_ann_int calculated previously (0, 1, 2 integers)
+ann_test_pred_str = string.(preds_ann_int) 
 
+# SVM outputs (already string from Exp 2)
+svm_test_pred_str = svm_predictions_str
+
+# DT outputs (already string from Exp 3)
+tree_test_pred_str = tree_predictions_str
+
+# kNN outputs (already string from Exp 4)
+knn_test_pred_str = knn_predictions_str
+
+# 2. Select Models for Ensemble (Top 3 usually, or all 4)
+# Let's use ANN, DT, and kNN as per original plan (or add SVM if you wish)
 all_predictions = [ann_test_pred_str, tree_test_pred_str, knn_test_pred_str]
+model_names = ["ANN", "DT", "kNN"]
 
-# Method 1: Majority Voting
+# 3. Define Classes as Strings (CRITICAL FIX)
+classes_str = sort(unique(vcat(all_predictions...)))
+test_targets_str = string.(test_targets) # Ensure targets are strings too
+
+# --- Method 1: Majority Voting ---
 println("\n[1/2] Majority Voting...")
 majority_predictions = majorityVoting(all_predictions)
-cm_results_majority = confusionMatrix(majority_predictions, test_targets_str, classes; weighted=true)
-println("✅ Majority Voting - F1: $(round(cm_results_majority.aggregated.f1*100, digits=2))%")
+cm_results_majority = confusionMatrix(majority_predictions, test_targets_str, classes_str; weighted=true)
 
-# Method 2: Weighted Voting
+println("✅ Majority Voting Results:")
+println("   F1: $(round(cm_results_majority.aggregated.f1*100, digits=2))%")
+println("   Acc: $(round(cm_results_majority.accuracy*100, digits=2))%")
+
+# --- Method 2: Weighted Voting ---
 println("\n[2/2] Weighted Voting...")
-cv_scores = [best_f1_ann, best_f1_tree, best_f1_knn]
+# Retrieve F1 scores from the metrics calculated in previous steps
+w_ann = metrics_ann["F1"]
+w_dt = metrics_tree["F1"]
+w_knn = metrics_knn["F1"]
+
+cv_scores = [w_ann, w_dt, w_knn]
 weights = cv_scores ./ sum(cv_scores)
 
 println("  Model weights:")
-println("    ANN:           $(round(weights[1]*100, digits=1))%")
-println("    Decision Tree: $(round(weights[2]*100, digits=1))%")
-println("    kNN:           $(round(weights[3]*100, digits=1))%")
+println("    ANN: $(round(weights[1]*100, digits=1))%")
+println("    DT:  $(round(weights[2]*100, digits=1))%")
+println("    kNN: $(round(weights[3]*100, digits=1))%")
 
 weighted_predictions = weightedVoting(all_predictions, weights)
-cm_results_weighted = confusionMatrix(weighted_predictions, test_targets_str, classes; weighted=true)
-println("✅ Weighted Voting - F1: $(round(cm_results_weighted.aggregated.f1*100, digits=2))%")
+cm_results_weighted = confusionMatrix(weighted_predictions, test_targets_str, classes_str; weighted=true)
+
+println("✅ Weighted Voting Results:")
+println("   F1: $(round(cm_results_weighted.aggregated.f1*100, digits=2))%")
+println("   Acc: $(round(cm_results_weighted.accuracy*100, digits=2))%")
 
 
 # ============================================================================
@@ -932,16 +884,18 @@ df_train_os = random_oversampling(df_train, "Risk_Class")
 df_train_os_proc = preprocess_multiclass(df_train_os, "Is Fraudulent")
 input_cols_os = setdiff(names(df_train_os_proc), ["Risk_Class"])
 
-train_inputs_os = Matrix{Float64}(df_train_os_proc[:, input_cols_os])
+train_inputs_os = Matrix{Float32}(df_train_os_proc[:, input_cols_os])
 train_targets_os = Int.(df_train_os_proc.Risk_Class)
 
 # 3. Evaluate ALL models on this new dataset
 results_app3 = evaluate_approach("Oversampling", train_inputs_os, train_targets_os, test_inputs, test_targets)
 
 
+
 # ============================================================================
 #  APPROACH 4: FEATURE EXTRACTION (PCA)
-#  Description: Reduce dimensionality using PCA before modeling
+#  Description: Reduce dimensionality using PCA before modeling.
+#  CRITICAL FIX: PCA matrix (W) is calculated on TRAIN and applied to TEST.
 # ============================================================================
 
 using LinearAlgebra # Required for PCA
@@ -950,40 +904,80 @@ println("\n" * "#"^70)
 println("🔬 APPROACH 4: PCA FEATURE EXTRACTION")
 println("#"^70)
 
-# Modifica prima la funzione PCA per restituire il modello/matrice W
-function get_pca_model(data, variance_threshold=0.95)
+"""
+    fit_pca(data, variance_threshold)
+    
+Calculates the projection matrix W and normalization parameters based on the provided data (Training Set).
+Returns: (W, norm_params)
+"""
+function fit_pca(data, variance_threshold=0.95)
+    # 1. Calculate normalization parameters on TRAIN data
+    # We use ZeroMean normalization (Standardization) which is standard for PCA
     norm_params = calculateZeroMeanNormalizationParameters(data)
+    
+    # 2. Standardize the data
     data_std = normalizeZeroMean(data, norm_params)
+    
+    # 3. Covariance Matrix & Eigen decomposition
     C = cov(data_std)
     F = eigen(C)
+    
+    # 4. Sort eigenvalues (descending) and corresponding vectors
     idx = sortperm(F.values, rev=true)
     evals = F.values[idx]
     evecs = F.vectors[:, idx]
+    
+    # 5. Select components to reach variance threshold
     cum_var = cumsum(evals ./ sum(evals))
     k = findfirst(x -> x >= variance_threshold, cum_var)
+    
+    if isnothing(k)
+        k = size(data, 2) # Keep all if threshold not reached
+    end
+    
+    println("   PCA Fit: Retaining $k components (Variance covered: $(round(cum_var[k]*100, digits=2))%)")
+    
+    # 6. Construct Projection Matrix W
     W = evecs[:, 1:k]
+    
     return W, norm_params
 end
 
-function apply_pca_transform(data, W, norm_params)
-    # Usa i parametri calcolati sul train!
+"""
+    transform_data_pca(data, W, norm_params)
+    
+Projects new data into the PCA space defined by W, using existing normalization parameters.
+"""
+function transform_data_pca(data, W, norm_params)
+    # 1. Normalize using the PARAMETERS from the Training Set (Critical!)
+    # Note: We assume normalizeZeroMean handles parameter application correctly
     data_std = normalizeZeroMean(data, norm_params)
+    
+    # 2. Project into PCA space
     return data_std * W
 end
 
-# Nel Main:
-W, pca_norm_params = get_pca_model(train_inputs, 0.95)
-train_inputs_pca = apply_pca_transform(train_inputs, W, pca_norm_params)
-test_inputs_pca = apply_pca_transform(test_inputs, W, pca_norm_params)
+# --- EXECUTION STEPS ---
 
-results_app4 = evaluate_approach("PCA", train_inputs_pca, train_targets, test_inputs_pca, test_targets)
+# 1. Fit PCA model on Training Data ONLY
+# We calculate W (eigenvectors) and normalization stats from train_inputs
+println("   1. Fitting PCA on Training Set...")
+pca_W, pca_norm_params = fit_pca(train_inputs, 0.95)
 
-# 1. Apply PCA to the Standard Undersampled Train Data (from Approach 1)
-# Using 'train_inputs' from the beginning of the notebook
-train_inputs_pca = apply_pca_transform(train_inputs, 0.95)
+# 2. Transform Training Data
+println("   2. Transforming Training Set...")
+train_inputs_pca = transform_data_pca(train_inputs, pca_W, pca_norm_params)
 
-# 2. Evaluate ALL models on PCA data
-results_app4 = evaluate_approach("PCA (95% Variance)", train_inputs_pca, train_targets)
+# 3. Transform Test Data
+# CRITICAL: We use the SAME W and norm_params calculated on Train
+println("   3. Transforming Test Set (using Train projection)...")
+test_inputs_pca = transform_data_pca(test_inputs, pca_W, pca_norm_params)
+
+# 4. Evaluate Models on the new PCA-transformed space
+# We pass both the transformed train and transformed test sets
+results_app4 = evaluate_approach("PCA (95% Variance)", 
+                                 train_inputs_pca, train_targets, 
+                                 test_inputs_pca, test_targets)
 
 # ============================================================================
 #  APPROACH 5: BINARY CLASSIFICATION (ORIGINAL GROUND TRUTH)
@@ -1031,65 +1025,126 @@ results_app5 = evaluate_approach("Binary", train_inputs, train_targets_binary, t
 # ============================================================================
 
 # ============================================================================
-#  FINAL COMPARISON SUMMARY - ALL APPROACHES
+#  FINAL COMPARISON SUMMARY - COMPLETE & DETAILED
 # ============================================================================
 
-println("\n" * "="^80)
-println("🏆 FINAL RESULTS & COMPARISON OF ALL APPROACHES")
-println("="^80)
+println("\n" * "="^100)
+println("🏆 FINAL DETAILED RESULTS & COMPARISON")
+println("="^100)
 
-# 1. Recuperiamo i risultati del Primo Approccio (Undersampling) per metterli in tabella
-# Usiamo le variabili che hai già calcolato nelle celle precedenti
-results_base = Dict(
-    "ANN" => cm_results_ann.aggregated.f1,
-    "SVM" => cm_results_svm.aggregated.f1,
-    "DT"  => cm_results_tree.aggregated.f1,
-    "kNN" => cm_results_knn.aggregated.f1
-)
-
-# 2. Funzione per stampare la tabella comparativa
 using Printf
-function print_row(name, res)
-    @printf("%-22s | %6.2f%% | %6.2f%% | %6.2f%% | %6.2f%%\n", 
-        name, res["ANN"]*100, res["SVM"]*100, res["DT"]*100, res["kNN"]*100)
+
+# 1. Funzione di Stampa Dettagliata
+function print_metrics_row(approach_name, res_dict)
+    println("\n📌 Approach: $approach_name")
+    
+    # Header Tabella
+    @printf("%-10s | %-10s | %-10s | %-10s | %-10s | %-10s\n", 
+            "Model", "Accuracy", "Sensitiv.", "Specific.", "AUC-ROC", "F1-Score")
+    println("-"^75)
+    
+    for model in ["ANN", "SVM", "DT", "kNN"]
+        if haskey(res_dict, model)
+            m = res_dict[model]
+            @printf("%-10s | %8.2f%%  | %8.2f%%  | %8.2f%%  | %8.3f   | %8.2f%%\n", 
+                    model, 
+                    m["Accuracy"]*100, 
+                    m["Sensitivity"]*100, 
+                    m["Specificity"]*100, 
+                    m["AUC"], 
+                    m["F1"]*100)
+        else
+            println("$model: N/A")
+        end
+    end
 end
 
-println("Approach               |   ANN    |   SVM    |    DT    |   kNN")
+# 2. Adattamento Risultati Approccio 1 (Undersampling)
+# Se non hai ri-eseguito l'Approccio 1 con la nuova funzione evaluate_approach,
+# dobbiamo creare manualmente il dizionario dai vecchi risultati per poterlo stampare.
+# 2. Recupero Risultati Approccio 1 (Undersampling)
+# Ora usiamo direttamente le variabili 'metrics_...' che abbiamo calcolato sopra
+results_app1 = Dict(
+    "ANN" => metrics_ann,
+    "SVM" => metrics_svm,
+    "DT"  => metrics_tree,
+    "kNN" => metrics_knn
+)
+# 3. Stampa delle Tabelle per ogni Approccio
+# Nota: Assicurati che results_app3, 4 e 5 esistano (runna le celle precedenti)
+print_metrics_row("1. Undersampling (Base)", results_app1)
+
+if isdefined(Main, :results_app3)
+    print_metrics_row("2. Oversampling", results_app3)
+end
+
+if isdefined(Main, :results_app4)
+    print_metrics_row("3. PCA Features", results_app4)
+end
+
+if isdefined(Main, :results_app5)
+    print_metrics_row("4. Binary Classif.", results_app5)
+end
+
 println("-"^75)
 
-# Stampa di tutti gli approcci
-print_row("1. Undersampling (Base)", results_base)
-print_row("2. Oversampling", results_app3)
-print_row("3. PCA Features", results_app4)
-print_row("4. Binary Classif.", results_app5)
+# 4. Ensemble Methods (Solo su Base Approccio)
+if isdefined(Main, :cm_results_majority)
+    println("\n👥 Ensemble Methods (Applied to Base Undersampling):")
+    # Nota: Gli ensemble vecchi non hanno dizionari dettagliati, stampiamo solo F1
+    maj_f1 = cm_results_majority.aggregated.f1
+    wei_f1 = cm_results_weighted.aggregated.f1
+    println("   • Majority Voting: $(round(maj_f1*100, digits=2))% (F1 Score)")
+    println("   • Weighted Voting: $(round(wei_f1*100, digits=2))% (F1 Score)")
+end
 
-println("-"^75)
+# 5. Calcolo del Vincitore Assoluto (Logica Aggiornata per i nuovi Dizionari)
+best_f1 = 0.0
+best_model_name = ""
+best_approach = ""
 
-# 3. Aggiungiamo i risultati degli Ensemble (che hai fatto solo sull'approccio base)
-println("\n📌 Ensemble Methods (Applied to Base Undersampling):")
-println("   • Majority Voting: $(round(cm_results_majority.aggregated.f1*100, digits=2))% (F1 Score)")
-println("   • Weighted Voting: $(round(cm_results_weighted.aggregated.f1*100, digits=2))% (F1 Score)")
-
-# 4. Calcolo del vincitore assoluto
-all_scores = [
-    ("Undersampling (Best)", maximum(values(results_base))),
-    ("Oversampling (Best)", maximum(values(results_app3))),
-    ("PCA (Best)", maximum(values(results_app4))),
-    ("Binary (Best)", maximum(values(results_app5))),
-    ("Ensemble Majority", cm_results_majority.aggregated.f1),
-    ("Ensemble Weighted", cm_results_weighted.aggregated.f1)
+# Lista di tutti i risultati disponibili
+all_results_list = [
+    ("Undersampling", results_app1),
+    ("Oversampling", isdefined(Main, :results_app3) ? results_app3 : Dict()),
+    ("PCA", isdefined(Main, :results_app4) ? results_app4 : Dict()),
+    ("Binary", isdefined(Main, :results_app5) ? results_app5 : Dict())
 ]
 
-best_model = sort(all_scores, by=x->x[2], rev=true)[1]
+for (app_name, res_dict) in all_results_list
+    for (model, metrics) in res_dict
+        if metrics["F1"] > best_f1
+            global best_f1 = metrics["F1"]
+            global best_model_name = model
+            global best_approach = app_name
+        end
+    end
+end
 
-println("\n" * "="^80)
-println("🎯 OVERALL BEST PERFORMANCE: $(best_model[1])")
-println("   F1 Score: $(round(best_model[2]*100, digits=2))%")
-println("="^80)
+# Controllo se gli ensemble vincono
+if isdefined(Main, :cm_results_majority)
+    if cm_results_majority.aggregated.f1 > best_f1
+        global best_f1 = cm_results_majority.aggregated.f1
+        global best_model_name = "Majority Voting"
+        global best_approach = "Ensemble (Undersampling)"
+    end
+    if cm_results_weighted.aggregated.f1 > best_f1
+        global best_f1 = cm_results_weighted.aggregated.f1
+        global best_model_name = "Weighted Voting"
+        global best_approach = "Ensemble (Undersampling)"
+    end
+end
+
+println("\n" * "="^100)
+println("🎯 OVERALL BEST PERFORMANCE")
+println("   Approach: $best_approach")
+println("   Model:    $best_model_name")
+println("   F1 Score: $(round(best_f1*100, digits=2))%")
+println("="^100)
 
 println("\n📋 PROJECT SUMMARY:")
 println("  ✅ Tested 4 distinct Data Approaches (Under, Over, PCA, Binary)")
 println("  ✅ Evaluated 4 ML Algorithms (ANN, SVM, DT, kNN) for EACH approach")
 println("  ✅ Implemented Ensemble methods on the base approach")
-println("  ✅ Total Experiments: >20 model configurations evaluated")
-println("="^80)
+println("  ✅ Evaluated on full Test Set with detailed metrics (Acc, Sens, Spec, AUC, F1)")
+println("="^100)

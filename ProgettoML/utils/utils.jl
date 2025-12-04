@@ -1205,7 +1205,7 @@ function modelCrossValidation(
 
     inputs, targets = dataset
 
-    # --- Handle ANN case (as in original course code) ---
+    # --- Handle ANN case ---
     if modelType == :ANN
         topology = get(modelHyperparameters, "topology", [5, 3])
         learningRate = get(modelHyperparameters, "learningRate", 0.003)
@@ -1215,13 +1215,9 @@ function modelCrossValidation(
         maxEpochsVal = get(modelHyperparameters, "maxEpochsVal", 25)
         
         return ANNCrossValidation(
-            topology,
-            dataset,
-            crossValidationIndices;
-            numExecutions = numExecutions,
-            maxEpochs = maxEpochs,
-            learningRate = learningRate,
-            validationRatio = validationRatio,
+            topology, dataset, crossValidationIndices;
+            numExecutions = numExecutions, maxEpochs = maxEpochs,
+            learningRate = learningRate, validationRatio = validationRatio,
             maxEpochsVal = maxEpochsVal
         )
     end
@@ -1242,16 +1238,15 @@ function modelCrossValidation(
     npvs = zeros(Float64, numFolds)
     f1s = zeros(Float64, numFolds)
     
+    # Accumulator for CM
     globalConfusionMatrix = zeros(Int64, numClasses, numClasses)
 
-    # Cross-validation loop
     for k in 1:numFolds
         testIndices = (crossValidationIndices .== k)
         trainIndices = .!testIndices
 
         Xtrain = inputs[trainIndices, :]
         ytrain = targets_str[trainIndices]
-        
         Xtest = inputs[testIndices, :]
         ytest = targets_str[testIndices]
 
@@ -1262,85 +1257,81 @@ function modelCrossValidation(
 
         # Create model
         local model
-        
         if modelType == :SVC
             kernel_str = get(modelHyperparameters, "kernel", "rbf")
-            local kernel_func
-            if kernel_str == "linear"
-                kernel_func = LIBSVM.Kernel.Linear
-            elseif kernel_str == "poly"
-                kernel_func = LIBSVM.Kernel.Polynomial
-            elseif kernel_str == "sigmoid"
-                kernel_func = LIBSVM.Kernel.Sigmoid
-            else
-                kernel_func = LIBSVM.Kernel.RadialBasis
-            end
-
-            C = Float64(get(modelHyperparameters, "C", 1.0))
-            gamma = Float64(get(modelHyperparameters, "gamma", 0.125))
-            degree = Int32(get(modelHyperparameters, "degree", 3))
-            coef0 = Float64(get(modelHyperparameters, "coef0", 0.0))
-
+            kernel_func = kernel_str == "linear" ? LIBSVM.Kernel.Linear : 
+                          (kernel_str == "poly" ? LIBSVM.Kernel.Polynomial : LIBSVM.Kernel.RadialBasis)
+            
             model = SVMClassifier(
                 kernel=kernel_func,
-                cost=C,
-                gamma=gamma,
-                degree=degree,
-                coef0=coef0
+                cost=Float64(get(modelHyperparameters, "C", 1.0)),
+                gamma=Float64(get(modelHyperparameters, "gamma", 0.125)),
+                degree=Int32(get(modelHyperparameters, "degree", 3)),
+                coef0=Float64(get(modelHyperparameters, "coef0", 0.0))
             )
-
         elseif modelType == :DecisionTreeClassifier
-            max_depth = get(modelHyperparameters, "max_depth", -1)
-            rng = Random.MersenneTwister(42)
-            model = DTClassifier(max_depth=max_depth, rng=rng)
-
+            model = DTClassifier(
+                max_depth=get(modelHyperparameters, "max_depth", -1), 
+                rng=Random.MersenneTwister(42)
+            )
         elseif modelType == :KNeighborsClassifier
-            k_neighbors = get(modelHyperparameters, "n_neighbors", 5)
-            model = kNNClassifier(K=k_neighbors)
-        
+            model = kNNClassifier(K=get(modelHyperparameters, "n_neighbors", 5))
         else
             error("Unknown modelType: $modelType")
         end
 
-        # Fit model
+        # Fit & Predict
         mach = machine(model, MLJ.table(Xtrain_norm), categorical(ytrain))
         MLJ.fit!(mach, verbosity=0)
-
-        # Predict
         predictions_raw = MLJ.predict(mach, MLJ.table(Xtest_norm))
         
-        local ŷ
-        if modelType == :SVC
-            ŷ = predictions_raw
+        # Get predictions
+        ŷ = modelType == :SVC ? predictions_raw : mode.(predictions_raw)
+        
+        # --- METRIC CALCULATION (Fixing the Binary/Multiclass Crash) ---
+        if numClasses == 2
+            # BINARY CASE: Convert to boolean vectors and use binary CM
+            # Assuming the "positive" class is the second one or "1"
+            pos_label = classes[2] 
+            y_pred_bool = ŷ .== pos_label
+            y_true_bool = ytest .== pos_label
+            
+            (acc, err, sens, spec, prec, npv, f1, cm) = confusionMatrix(y_pred_bool, y_true_bool)
+            
+            accuracies[k] = acc
+            error_rates[k] = err
+            sensitivities[k] = sens
+            specificities[k] = spec
+            ppvs[k] = prec
+            npvs[k] = npv
+            f1s[k] = f1
+            globalConfusionMatrix .+= cm
         else
-            ŷ = mode.(predictions_raw)
+            # MULTICLASS CASE: Use the weighted CM
+            cm_results = confusionMatrix(ŷ, ytest, classes; weighted=true)
+            
+            accuracies[k] = cm_results.accuracy
+            error_rates[k] = cm_results.errorrate
+            sensitivities[k] = cm_results.aggregated.sensitivity
+            specificities[k] = cm_results.aggregated.specificity
+            ppvs[k] = cm_results.aggregated.ppv
+            npvs[k] = cm_results.aggregated.npv
+            f1s[k] = cm_results.aggregated.f1
+            globalConfusionMatrix .+= cm_results.CM
         end
-        
-        # Calculate metrics using confusionMatrix from utils
-        cm_results = confusionMatrix(ŷ, ytest, classes; weighted=true)
-        
-        accuracies[k] = cm_results.accuracy
-        error_rates[k] = cm_results.errorrate
-        sensitivities[k] = cm_results.aggregated.sensitivity
-        specificities[k] = cm_results.aggregated.specificity
-        ppvs[k] = cm_results.aggregated.ppv
-        npvs[k] = cm_results.aggregated.npv
-        f1s[k] = cm_results.aggregated.f1
-        
-        globalConfusionMatrix .+= cm_results.CM
     end
 
     # Calculate statistics
-    acc_stats = (mean(accuracies), std(accuracies))
-    err_stats = (mean(error_rates), std(error_rates))
-    sens_stats = (mean(sensitivities), std(sensitivities))
-    spec_stats = (mean(specificities), std(specificities))
-    ppv_stats = (mean(ppvs), std(ppvs))
-    npv_stats = (mean(npvs), std(npvs))
-    f1_stats = (mean(f1s), std(f1s))
-    
-    # Return 8-tuple (same format as course function)
-    return (acc_stats, err_stats, sens_stats, spec_stats, ppv_stats, npv_stats, f1_stats, globalConfusionMatrix)
+    return (
+        (mean(accuracies), std(accuracies)),
+        (mean(error_rates), std(error_rates)),
+        (mean(sensitivities), std(sensitivities)),
+        (mean(specificities), std(specificities)),
+        (mean(ppvs), std(ppvs)),
+        (mean(npvs), std(npvs)),
+        (mean(f1s), std(f1s)),
+        globalConfusionMatrix
+    )
 end
 
 # ============================================================================
@@ -1368,4 +1359,53 @@ function crossvalidation(targets::AbstractArray{Int,1}, k::Int64)
     end
     
     return indices
+end
+
+
+# ============================================================================
+#  GLOBAL HELPER: SAFE METRICS CALCULATION (ACC, SENS, SPEC, AUC, F1)
+# ============================================================================
+function calculate_metrics_safe(y_pred_probs, y_pred_class, y_true_class, y_true_onehot, classes)
+    # 1. AUC Calculation (Trapezoidal rule for Binary, 0.5 placeholder for Multiclass)
+    auc_score = 0.5
+    if length(classes) == 2
+        # Binary Case: assume positive class is the second one (sorted)
+        probs = vec(y_pred_probs)
+        true_bin = vec(y_true_onehot) 
+        
+        p = sortperm(probs)
+        probs_sorted = probs[p]; true_sorted = true_bin[p]
+        tpr = [0.0]; fpr = [0.0]
+        num_pos = sum(true_sorted); num_neg = length(true_sorted) - num_pos
+        
+        if num_pos > 0 && num_neg > 0
+            tp = 0; fp = 0
+            for i in length(probs_sorted):-1:1
+                if true_sorted[i] == 1; tp += 1; else; fp += 1; end
+                push!(tpr, tp/num_pos); push!(fpr, fp/num_neg)
+            end
+            auc_score = 0.0
+            for i in 2:length(tpr)
+                auc_score += (fpr[i] - fpr[i-1]) * (tpr[i] + tpr[i-1]) / 2
+            end
+        end
+    end
+
+    # 2. Standard Metrics via confusionMatrix
+    acc, sens, spec, f1 = 0.0, 0.0, 0.0, 0.0
+    if length(classes) == 2
+        pos_label = classes[end]
+        # Ensure boolean vectors
+        y_p_bool = vec(y_pred_class .== pos_label)
+        y_t_bool = vec(y_true_class .== pos_label)
+        (acc, err, sens, spec, prec, npv, f1, cm) = confusionMatrix(y_p_bool, y_t_bool)
+    else
+        cm_res = confusionMatrix(y_pred_class, y_true_class, classes; weighted=true)
+        acc = cm_res.accuracy
+        sens = cm_res.aggregated.sensitivity
+        spec = cm_res.aggregated.specificity
+        f1 = cm_res.aggregated.f1
+    end
+
+    return Dict("Accuracy"=>acc, "AUC"=>auc_score, "Sensitivity"=>sens, "Specificity"=>spec, "F1"=>f1)
 end

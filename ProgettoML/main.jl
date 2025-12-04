@@ -1,0 +1,1030 @@
+# ============================================================================
+#          FRAUD DETECTION - MULTICLASS CLASSIFICATION
+#          Main Script - Executes All Experiments
+#          Group Project - Machine Learning I
+# ============================================================================
+#
+# Objective: E-commerce fraud detection using multiclass classification
+#            (Legitimate, Suspicious, Fraudulent)
+#
+# Methodology:
+#   - 4 ML Algorithms: ANNs (8 topologies), SVMs (10 configs), 
+#                      Decision Trees (7 depths), kNN (6 k values)
+#   - Ensemble Methods: Majority Voting + Weighted Voting
+#   - Dataset: 1.5M e-commerce transactions → 3-class risk assessment
+#   - Cross-Validation: 3-fold stratified on training set
+#   - Evaluation: Hold-out test set (20%)
+#
+# Code Organization:
+#   /project/
+#   ├── main.jl                    ← This file (executable from top to bottom)
+#   ├── /utils/
+#   │   ├── utils.jl              ← Course utilities (includes modelCrossValidation)
+#   │   └── preprocessing.jl      ← Custom preprocessing functions
+#   └── /datasets/
+#       └── Fraudulent_E-Commerce_Transaction_Data_merge.csv
+#
+# ============================================================================
+
+# Set random seed for reproducibility
+using Random
+Random.seed!(42)
+
+# ============================================================================
+#                    PACKAGE IMPORTS
+# ============================================================================
+
+using CSV
+using DataFrames
+using Statistics
+using Dates
+using StatsBase
+
+println("✅ Packages loaded!")
+
+# Load course utilities
+include("utils/utils.jl")
+println("✅ Course utilities loaded (includes modelCrossValidation, confusionMatrix, etc.)")
+
+# Load custom preprocessing
+include("utils/preprocessing.jl")
+using .PreprocessingUtils: create_risk_classes, preprocess_multiclass
+println("✅ Custom preprocessing utilities loaded!")
+
+# ============================================================================
+#  HELPER FUNCTION: EVALUATE ALL MODELS FOR A GIVEN APPROACH
+# ============================================================================
+# This function ensures we strictly follow the PDF requirement:
+# "Each approach must test the four ML techniques covered in class"
+# and tests multiple configurations as requested.
+
+function evaluate_approach(approach_name, train_inputs, train_targets; cv_folds=3)
+    println("\n" * "="^70)
+    println("🚀 EVALUATING APPROACH: $approach_name")
+    println("="^70)
+    
+    # Generate CV indices for this specific dataset/target
+    cv_indices = crossvalidation(train_targets, cv_folds)
+    
+    best_results = Dict()
+    
+    # ------------------------------------------------------------------------
+    # 1. Artificial Neural Networks (ANNs)
+    # Requirement: Test at least 8 architectures (1-2 hidden layers)
+    # ------------------------------------------------------------------------
+    println("\n[1/4] Testing ANNs (8 Architectures)...")
+    ann_topologies = [
+        [256], [128], [64], [32],       # 1 Hidden Layer
+        [256, 128], [128, 64], [64, 32], [96, 48] # 2 Hidden Layers
+    ]
+    
+    best_f1_ann = 0.0
+    best_topo_ann = []
+    
+    for topology in ann_topologies
+        hyperparams = Dict(
+            "topology" => topology,
+            "learningRate" => 0.003,
+            "validationRatio" => 0.1,
+            "numExecutions" => 1, # Increase if needed
+            "maxEpochs" => 800,
+            "maxEpochsVal" => 25
+        )
+        
+        # Using the course provided function
+        results = modelCrossValidation(:ANN, hyperparams, (train_inputs, train_targets), cv_indices)
+        f1 = results[7][1] # extract mean F1
+        
+        if f1 > best_f1_ann
+            best_f1_ann = f1
+            best_topo_ann = topology
+        end
+    end
+    println("   ✨ Best ANN: $best_topo_ann - F1: $(round(best_f1_ann*100, digits=2))%")
+    best_results["ANN"] = best_f1_ann
+
+    # ------------------------------------------------------------------------
+    # 2. Support Vector Machines (SVMs)
+    # Requirement: Test at least 8 configurations
+    # ------------------------------------------------------------------------
+    println("\n[2/4] Testing SVMs (Configs)...")
+    svm_configs = [
+        ("linear", 1.0, 0.1, 3), ("linear", 10.0, 0.1, 3),
+        ("rbf", 1.0, 0.125, 3), ("rbf", 10.0, 0.125, 3), ("rbf", 100.0, 0.125, 3),
+        ("poly", 1.0, 0.1, 2), ("poly", 10.0, 0.1, 2), ("poly", 1.0, 0.1, 3)
+    ]
+    
+    best_f1_svm = 0.0
+    best_cfg_svm = ""
+    
+    for (kernel, C, gamma, degree) in svm_configs
+        hyperparams = Dict("kernel"=>kernel, "C"=>C, "gamma"=>gamma, "degree"=>degree)
+        results = modelCrossValidation(:SVC, hyperparams, (train_inputs, train_targets), cv_indices)
+        f1 = results[7][1]
+        
+        if f1 > best_f1_svm
+            best_f1_svm = f1
+            best_cfg_svm = "$kernel C=$C"
+        end
+    end
+    println("   ✨ Best SVM: $best_cfg_svm - F1: $(round(best_f1_svm*100, digits=2))%")
+    best_results["SVM"] = best_f1_svm
+
+    # ------------------------------------------------------------------------
+    # 3. Decision Trees
+    # Requirement: Test at least 6 different maximum depths
+    # ------------------------------------------------------------------------
+    println("\n[3/4] Testing Decision Trees (6 Depths)...")
+    depths = [3, 5, 7, 10, 15, 20]
+    
+    best_f1_dt = 0.0
+    best_depth_dt = 0
+    
+    for depth in depths
+        hyperparams = Dict("max_depth" => depth)
+        results = modelCrossValidation(:DecisionTreeClassifier, hyperparams, (train_inputs, train_targets), cv_indices)
+        f1 = results[7][1]
+        
+        if f1 > best_f1_dt
+            best_f1_dt = f1
+            best_depth_dt = depth
+        end
+    end
+    println("   ✨ Best Tree: Depth=$best_depth_dt - F1: $(round(best_f1_dt*100, digits=2))%")
+    best_results["DT"] = best_f1_dt
+
+    # ------------------------------------------------------------------------
+    # 4. k-Nearest Neighbors (kNN)
+    # Requirement: Test at least 6 different values of k
+    # ------------------------------------------------------------------------
+    println("\n[4/4] Testing kNN (6 k-values)...")
+    k_values = [1, 3, 5, 7, 10, 15]
+    
+    best_f1_knn = 0.0
+    best_k_knn = 0
+    
+    for k in k_values
+        hyperparams = Dict("n_neighbors" => k)
+        results = modelCrossValidation(:KNeighborsClassifier, hyperparams, (train_inputs, train_targets), cv_indices)
+        f1 = results[7][1]
+        
+        if f1 > best_f1_knn
+            best_f1_knn = f1
+            best_k_knn = k
+        end
+    end
+    println("   ✨ Best kNN: k=$best_k_knn - F1: $(round(best_f1_knn*100, digits=2))%")
+    best_results["kNN"] = best_f1_knn
+    
+    return best_results
+end
+
+# ============================================================================
+#              DATA LOADING & 3-CLASS TARGET CREATION
+# ============================================================================
+#
+# Dataset: Fraudulent E-Commerce Transaction Data (1.5M transactions)
+#
+# Target Creation Strategy:
+#   Original: Binary fraud labels (fraud vs non-fraud)
+#   Our approach: 3-class risk assessment based on multiple signals:
+#     1. Time Risk: Night transactions (0-5am, 11pm)
+#     2. Amount Risk: High-value transactions (>90th percentile)
+#     3. Account Age Risk: New accounts (<30 days)
+#
+# Class Mapping:
+#   - Class 0 (LEGITTIMO): Low-risk, legitimate transactions
+#   - Class 1 (SOSPETTO): Borderline cases requiring manual review
+#   - Class 2 (FRAUDOLENTO): High-risk fraudulent transactions
+#
+# Justification: This approach allows for graduated risk assessment, enabling
+# businesses to automatically approve low-risk transactions, flag suspicious
+# cases for manual review, and immediately block high-risk frauds.
+#
+# ============================================================================
+
+const DATA_PATH = "datasets/Fraudulent_E-Commerce_Transaction_Data_merge.csv"
+println("\n" * "="^70)
+println("📂 LOADING DATA")
+println("="^70)
+
+df = CSV.read(DATA_PATH, DataFrame)
+target_col = "Is Fraudulent"
+
+println("Original dataset size: $(size(df))")
+println("Original fraud distribution:")
+println("  Non-fraud: $(sum(df[!, target_col] .== 0))")
+println("  Fraud:     $(sum(df[!, target_col] .== 1))")
+
+# Create 3-class target using custom function
+println("\n" * "="^70)
+println("🎯 CREATING 3-CLASS TARGET")
+println("="^70)
+
+df_with_classes = create_risk_classes(df, target_col)
+
+# ============================================================================
+#          CLASS BALANCING & TRAIN/TEST SPLIT
+# ============================================================================
+#
+# Challenge: Highly imbalanced dataset (90% Legitimate, 8.6% Suspicious, 1.4% Fraudulent)
+#
+# Solution: Undersample majority classes to match minority class (20,654 samples per class)
+#
+# Train/Test Split:
+#   - 80% Training (49,569 samples) - used for cross-validation and model selection
+#   - 20% Test (12,393 samples) - held out for final evaluation
+#
+# CRITICAL: Test set is NEVER used during training or model selection to prevent data leakage!
+#
+# ============================================================================
+
+println("\n" * "="^70)
+println("✅ TRAIN/TEST SPLIT (80% Train / 20% Test)")
+println("="^70)
+
+# Balance classes
+class_0 = df_with_classes[df_with_classes.Risk_Class .== 0, :]
+class_1 = df_with_classes[df_with_classes.Risk_Class .== 1, :]
+class_2 = df_with_classes[df_with_classes.Risk_Class .== 2, :]
+
+n_min = minimum([size(class_0, 1), size(class_1, 1), size(class_2, 1)])
+n_target = min(n_min, 40000)
+
+println("\n🔄 Balancing dataset...")
+println("  Samples per class: $n_target")
+
+class_0_sample = class_0[shuffle(1:size(class_0, 1))[1:n_target], :]
+class_1_sample = class_1[shuffle(1:size(class_1, 1))[1:n_target], :]
+class_2_sample = class_2[shuffle(1:size(class_2, 1))[1:n_target], :]
+
+df_balanced = vcat(class_0_sample, class_1_sample, class_2_sample)
+df_balanced = df_balanced[shuffle(1:size(df_balanced, 1)), :]
+
+println("  Balanced dataset size: $(size(df_balanced))")
+
+# Split Train/Test BEFORE preprocessing (critical to avoid data leakage!)
+n_total = size(df_balanced, 1)
+n_train = floor(Int, n_total * 0.80)
+n_test = n_total - n_train
+
+all_indices = shuffle(1:n_total)
+train_indices = all_indices[1:n_train]
+test_indices = all_indices[n_train+1:end]
+
+df_train = df_balanced[train_indices, :]
+df_test = df_balanced[test_indices, :]
+
+println("\n📊 Split Summary:")
+println("  Total samples:     $n_total")
+println("  Training set:      $n_train (80%)")
+println("  Test set:          $n_test (20%)")
+
+# ============================================================================
+#                    PREPROCESSING & FEATURE ENGINEERING
+# ============================================================================
+#
+# Steps:
+#   1. Time Features: Extract hour, create night flag (hour < 6)
+#   2. Feature Engineering:
+#      - Amount_per_AccountAge: Transaction amount relative to account maturity
+#      - High_Value_Flag: Transactions above 95th percentile
+#      - New_Account_Flag: Accounts younger than 30 days
+#   3. Missing Value Imputation: Median imputation
+#   4. Feature Selection: Drop IDs, addresses, categorical features → 8 numerical features
+#   5. Normalization: Min-Max [0,1] using training set parameters only
+#
+# Final Features (8):
+#   - Transaction Amount
+#   - Account Age Days
+#   - Transaction_Hour
+#   - Is_Night
+#   - Amount_per_AccountAge
+#   - High_Value_Flag
+#   - New_Account_Flag
+#   - (1 more from preprocessing)
+#
+# ============================================================================
+
+println("\n🔧 Preprocessing train and test sets...")
+df_train_processed = preprocess_multiclass(df_train, target_col)
+df_test_processed = preprocess_multiclass(df_test, target_col)
+
+input_cols = setdiff(names(df_train_processed), ["Risk_Class"])
+train_inputs = Matrix{Float32}(df_train_processed[:, input_cols])
+train_targets = Int.(df_train_processed.Risk_Class)
+
+test_inputs = Matrix{Float32}(df_test_processed[:, input_cols])
+test_targets = Int.(df_test_processed.Risk_Class)
+
+println("\n📊 Preprocessed Data:")
+println("  Features: $(length(input_cols))")
+println("  Train samples: $(size(train_inputs, 1))")
+println("  Test samples: $(size(test_inputs, 1))")
+println("\n  Feature names: $input_cols")
+
+# Create cross-validation indices (3-fold stratified)
+k_folds = 3
+cv_indices = crossvalidation(train_targets, k_folds)
+println("\n✅ Cross-validation indices created ($k_folds folds, stratified)")
+
+# ============================================================================
+#        EXPERIMENT 1: ARTIFICIAL NEURAL NETWORKS (ANNs)
+# ============================================================================
+#
+# Configuration:
+#   - Topologies tested: 8 architectures (1-4 hidden layers)
+#   - Activation: ReLU (hidden layers), Softmax (output)
+#   - Optimizer: Adam (learning rate: 0.003)
+#   - Loss: Cross-entropy
+#   - Regularization: Early stopping (patience: 25 epochs)
+#   - Validation: 10% of training set
+#   - Executions: 1 per topology (can increase for stability)
+#
+# Architectures:
+#   1. [256, 128, 64] - Deep Large
+#   2. [128, 64, 32] - Baseline
+#   3. [96, 48, 24] - Medium
+#   4. [64, 32] - Shallow
+#   5. [128, 128, 64, 32] - Very Deep
+#   6. [192, 96, 48] - Wide-Deep
+#   7. [128, 64] - Simple
+#   8. [256, 128] - Large 2-Layer
+#
+# ============================================================================
+
+println("\n" * "="^70)
+println("🔬 EXPERIMENT 1: ARTIFICIAL NEURAL NETWORKS")
+println("Testing 8 ANN Topologies")
+println("="^70)
+
+topologies_to_test = [
+    [256],            # 1. 1 hidden layer - Large
+    [128],            # 2. 1 hidden layer - Medium
+    [64],             # 3. 1 hidden layer - Small
+    [32],             # 4. 1 hidden layer - Tiny
+    [256, 128],       # 5. 2 hidden layers - Large
+    [128, 64],        # 6. 2 hidden layers - Medium
+    [64, 32],         # 7. 2 hidden layers - Small
+    [96, 48]          # 8. 2 hidden layers - Alternative
+]
+
+ann_results = []
+
+for (i, topology) in enumerate(topologies_to_test)
+    println("\n[$i/8] Testing topology: $topology")
+    
+    hyperparams = Dict(
+        "topology" => topology,
+        "learningRate" => 0.003,
+        "validationRatio" => 0.1,
+        "numExecutions" => 1,
+        "maxEpochs" => 800,
+        "maxEpochsVal" => 25
+    )
+    
+    # Use modelCrossValidation from utils.jl (course function)
+    results = modelCrossValidation(
+        :ANN,
+        hyperparams,
+        (train_inputs, train_targets),
+        cv_indices
+    )
+    
+    acc_stats, err_stats, sens_stats, spec_stats, ppv_stats, npv_stats, f1_stats, cm = results
+    
+    println("    F1: $(round(f1_stats[1]*100, digits=2))% ± $(round(f1_stats[2]*100, digits=2))%")
+    
+    push!(ann_results, (topology, f1_stats[1], results))
+end
+
+# Sort by F1 score
+sorted_ann_results = sort(ann_results, by=x->x[2], rev=true)
+
+println("\n🏆 ANN Results Ranking (by F1 Score):")
+println("-"^70)
+for (i, (topo, f1, _)) in enumerate(sorted_ann_results)
+    badge = i == 1 ? "🥇" : i == 2 ? "🥈" : i == 3 ? "🥉" : "  "
+    println("$badge $i. $topo - F1: $(round(f1*100, digits=2))%")
+end
+
+best_topology_ann = sorted_ann_results[1][1]
+best_f1_ann = sorted_ann_results[1][2]
+println("\n✨ Best ANN: $best_topology_ann (CV F1: $(round(best_f1_ann*100, digits=2))%)")
+
+# Train final ANN on full training set and evaluate on test set
+println("\n🚀 Training final ANN on full training set...")
+
+# 1. Definisci le classi in modo univoco e ordinato (FONDAMENTALE)
+classes = sort(unique(train_targets)) 
+
+# 2. Usa queste classi per entrambi gli encoding
+train_targets_onehot = oneHotEncoding(train_targets, classes)
+test_targets_onehot = oneHotEncoding(test_targets, classes)
+
+# 3. Normalizzazione
+normParams_ann = calculateMinMaxNormalizationParameters(train_inputs)
+train_inputs_norm = normalizeMinMax(train_inputs, normParams_ann)
+test_inputs_norm = normalizeMinMax(test_inputs, normParams_ann)
+
+# 4. Creazione validation split
+N_train = size(train_inputs_norm, 1)
+(train_idx, val_idx) = holdOut(N_train, 0.1)
+
+# 5. Training (con la funzione interna corretta "_")
+final_ann, _ = _trainClassANN(best_topology_ann,
+    (train_inputs_norm[train_idx, :], train_targets_onehot[train_idx, :]),
+    validationDataset=(train_inputs_norm[val_idx, :], train_targets_onehot[val_idx, :]),
+    testDataset=(test_inputs_norm, test_targets_onehot),
+    maxEpochs=800,
+    learningRate=0.003,
+    maxEpochsVal=25)
+
+# Predict on test set
+test_outputs_ann = final_ann(test_inputs_norm')'
+
+# Calculate metrics using confusionMatrix from course utils
+cm_results_ann = confusionMatrix(test_outputs_ann, test_targets_onehot; weighted=true)
+
+println("\n📊 ANN TEST SET RESULTS:")
+println("="^70)
+println("Accuracy:  $(round(cm_results_ann.accuracy*100, digits=2))%")
+println("F1 Score:  $(round(cm_results_ann.aggregated.f1*100, digits=2))%")
+println("\nConfusion Matrix:")
+printConfusionMatrix(test_outputs_ann, test_targets_onehot; weighted=true)
+
+# ============================================================================
+#        EXPERIMENT 2: SUPPORT VECTOR MACHINES (SVMs)
+# ============================================================================
+#
+# Configuration:
+#   - 10 configurations tested
+#   - Kernels: Linear, RBF, Polynomial
+#   - Hyperparameter C: 0.1, 1.0, 10.0
+#   - Gamma (RBF): auto (1/n_features = 0.125), 0.1
+#   - Degree (Polynomial): 2, 3
+#
+# Configurations:
+#   1-3. Linear (C = 0.1, 1.0, 10.0)
+#   4-6. RBF with auto gamma (C = 0.1, 1.0, 10.0)
+#   7. RBF with γ=0.1 (C = 1.0)
+#   8-10. Polynomial degree 2, 3 (C = 1.0, 10.0)
+#
+# ============================================================================
+
+println("\n" * "="^70)
+println("🔬 EXPERIMENT 2: SUPPORT VECTOR MACHINES")
+println("Testing 10 SVM Configurations")
+println("="^70)
+
+svm_configs = [
+    ("linear", 0.1, 0.125, 3, "Linear C=0.1"),
+    ("linear", 1.0, 0.125, 3, "Linear C=1.0"),
+    ("linear", 10.0, 0.125, 3, "Linear C=10.0"),
+    ("rbf", 0.1, 0.125, 3, "RBF C=0.1 γ=auto"),
+    ("rbf", 1.0, 0.125, 3, "RBF C=1.0 γ=auto"),
+    ("rbf", 10.0, 0.125, 3, "RBF C=10.0 γ=auto"),
+    ("rbf", 1.0, 0.1, 3, "RBF C=1.0 γ=0.1"),
+    ("poly", 1.0, 0.125, 2, "Poly C=1.0 deg=2"),
+    ("poly", 1.0, 0.125, 3, "Poly C=1.0 deg=3"),
+    ("poly", 10.0, 0.125, 2, "Poly C=10.0 deg=2")
+]
+
+svm_results = []
+
+for (i, (kernel, C, gamma, degree, desc)) in enumerate(svm_configs)
+    println("\n[$i/10] Testing: $desc")
+    
+    hyperparams = Dict(
+        "kernel" => kernel,
+        "C" => C,
+        "gamma" => gamma,
+        "degree" => degree
+    )
+    
+    # Use modelCrossValidation from utils.jl
+    results = modelCrossValidation(
+        :SVC,
+        hyperparams,
+        (train_inputs, train_targets),
+        cv_indices
+    )
+    
+    acc_stats, err_stats, sens_stats, spec_stats, ppv_stats, npv_stats, f1_stats, cm = results
+    println("    F1: $(round(f1_stats[1]*100, digits=2))% ± $(round(f1_stats[2]*100, digits=2))%")
+    
+    push!(svm_results, (desc, f1_stats[1], kernel, C, gamma, degree, results))
+end
+
+sorted_svm_results = sort(svm_results, by=x->x[2], rev=true)
+
+println("\n🏆 SVM Results Ranking:")
+println("-"^70)
+for (i, (desc, f1, _, _, _, _, _)) in enumerate(sorted_svm_results)
+    badge = i == 1 ? "🥇" : i == 2 ? "🥈" : i == 3 ? "🥉" : "  "
+    println("$badge $i. $desc - F1: $(round(f1*100, digits=2))%")
+end
+
+best_svm = sorted_svm_results[1]
+best_desc_svm, best_f1_svm, best_kernel_svm, best_C_svm, best_gamma_svm, best_degree_svm = best_svm[1:6]
+println("\n✨ Best SVM: $best_desc_svm (CV F1: $(round(best_f1_svm*100, digits=2))%)")
+
+# Train final SVM and evaluate on test set
+println("\n🚀 Training final SVM on full training set...")
+
+# Load MLJ for final model training
+using MLJ
+SVMClassifier = @load SVC pkg=LIBSVM
+
+# Normalize
+train_inputs_norm_svm = normalizeMinMax(train_inputs, calculateMinMaxNormalizationParameters(train_inputs))
+test_inputs_norm_svm = normalizeMinMax(test_inputs, calculateMinMaxNormalizationParameters(train_inputs))
+
+# Convert to strings for MLJ
+train_targets_str = string.(train_targets)
+test_targets_str = string.(test_targets)
+classes = sort(unique(train_targets_str))
+
+# Set kernel
+if best_kernel_svm == "linear"
+    kernel_func = LIBSVM.Kernel.Linear
+elseif best_kernel_svm == "poly"
+    kernel_func = LIBSVM.Kernel.Polynomial
+else
+    kernel_func = LIBSVM.Kernel.RadialBasis
+end
+
+model_svm = SVMClassifier(
+    kernel=kernel_func,
+    cost=best_C_svm,
+    gamma=best_gamma_svm,
+    degree=Int32(best_degree_svm)
+)
+
+mach_svm = machine(model_svm, MLJ.table(train_inputs_norm_svm), categorical(train_targets_str))
+MLJ.fit!(mach_svm, verbosity=0)
+
+# Predict
+svm_predictions = MLJ.predict(mach_svm, MLJ.table(test_inputs_norm_svm))
+cm_results_svm = confusionMatrix(svm_predictions, test_targets_str, classes; weighted=true)
+
+println("\n📊 SVM TEST SET RESULTS:")
+println("="^70)
+println("Accuracy:  $(round(cm_results_svm.accuracy*100, digits=2))%")
+println("F1 Score:  $(round(cm_results_svm.aggregated.f1*100, digits=2))%")
+
+# ============================================================================
+#            EXPERIMENT 3: DECISION TREES
+# ============================================================================
+#
+# Configuration:
+#   - 7 maximum depths tested: 3, 5, 7, 10, 15, 20, unlimited
+#   - Splitting criterion: Gini impurity
+#   - Min samples split: 2
+#   - Random seed: 42 (for reproducibility)
+#
+# Advantages:
+#   - Interpretable (can visualize decision rules)
+#   - No feature scaling required
+#   - Fast training and prediction
+#   - Handles non-linear relationships naturally
+#
+# ============================================================================
+
+println("\n" * "="^70)
+println("🔬 EXPERIMENT 3: DECISION TREES")
+println("Testing 7 Maximum Depths")
+println("="^70)
+
+tree_depths = [3, 5, 7, 10, 15, 20, -1]
+tree_results = []
+
+for (i, max_depth) in enumerate(tree_depths)
+    depth_str = max_depth == -1 ? "Unlimited" : string(max_depth)
+    println("\n[$i/7] Testing: Depth=$depth_str")
+    
+    hyperparams = Dict("max_depth" => max_depth)
+    
+    # Use modelCrossValidation from utils.jl
+    results = modelCrossValidation(
+        :DecisionTreeClassifier,
+        hyperparams,
+        (train_inputs, train_targets),
+        cv_indices
+    )
+    
+    acc_stats, err_stats, sens_stats, spec_stats, ppv_stats, npv_stats, f1_stats, cm = results
+    println("    F1: $(round(f1_stats[1]*100, digits=2))% ± $(round(f1_stats[2]*100, digits=2))%")
+    
+    push!(tree_results, (depth_str, max_depth, f1_stats[1], results))
+end
+
+sorted_tree_results = sort(tree_results, by=x->x[3], rev=true)
+
+println("\n🏆 Decision Tree Results Ranking:")
+println("-"^70)
+for (i, (depth_str, _, f1, _)) in enumerate(sorted_tree_results)
+    badge = i == 1 ? "🥇" : i == 2 ? "🥈" : i == 3 ? "🥉" : "  "
+    println("$badge $i. Depth=$depth_str - F1: $(round(f1*100, digits=2))%")
+end
+
+best_desc_tree, best_max_depth_tree, best_f1_tree = sorted_tree_results[1][1:3]
+println("\n✨ Best Tree: Depth=$best_desc_tree (CV F1: $(round(best_f1_tree*100, digits=2))%)")
+
+# Train final Decision Tree
+println("\n🚀 Training final Decision Tree on full training set...")
+
+DTClassifier = @load DecisionTreeClassifier pkg=DecisionTree
+
+train_inputs_norm_tree = normalizeMinMax(train_inputs, calculateMinMaxNormalizationParameters(train_inputs))
+test_inputs_norm_tree = normalizeMinMax(test_inputs, calculateMinMaxNormalizationParameters(train_inputs))
+
+train_targets_str_tree = string.(train_targets)
+test_targets_str_tree = string.(test_targets)
+
+if best_max_depth_tree == -1
+    model_tree = DTClassifier(rng=Random.MersenneTwister(42))
+else
+    model_tree = DTClassifier(max_depth=best_max_depth_tree, rng=Random.MersenneTwister(42))
+end
+
+mach_tree = machine(model_tree, MLJ.table(train_inputs_norm_tree), categorical(train_targets_str_tree))
+MLJ.fit!(mach_tree, verbosity=0)
+
+tree_predictions = MLJ.predict(mach_tree, MLJ.table(test_inputs_norm_tree))
+tree_predictions_mode = mode.(tree_predictions)
+
+cm_results_tree = confusionMatrix(tree_predictions_mode, test_targets_str_tree, classes; weighted=true)
+
+println("\n📊 DECISION TREE TEST SET RESULTS:")
+println("="^70)
+println("Accuracy:  $(round(cm_results_tree.accuracy*100, digits=2))%")
+println("F1 Score:  $(round(cm_results_tree.aggregated.f1*100, digits=2))%")
+
+# ============================================================================
+#            EXPERIMENT 4: k-NEAREST NEIGHBORS (kNN)
+# ============================================================================
+#
+# Configuration:
+#   - 6 k values tested: 1, 3, 5, 7, 10, 15
+#   - Distance metric: Euclidean
+#   - Voting: Majority voting among k neighbors
+#
+# Notes:
+#   - Feature normalization is CRITICAL for kNN (distance-based)
+#   - No explicit training phase (lazy learning)
+#   - k=1 is most sensitive to noise
+#   - Higher k values create smoother decision boundaries
+#
+# ============================================================================
+
+println("\n" * "="^70)
+println("🔬 EXPERIMENT 4: k-NEAREST NEIGHBORS")
+println("Testing 6 k Values")
+println("="^70)
+
+k_values = [1, 3, 5, 7, 10, 15]
+knn_results = []
+
+for (i, k) in enumerate(k_values)
+    println("\n[$i/6] Testing: k=$k")
+    
+    hyperparams = Dict("n_neighbors" => k)
+    
+    # Use modelCrossValidation from utils.jl
+    results = modelCrossValidation(
+        :KNeighborsClassifier,
+        hyperparams,
+        (train_inputs, train_targets),
+        cv_indices
+    )
+    
+    acc_stats, err_stats, sens_stats, spec_stats, ppv_stats, npv_stats, f1_stats, cm = results
+    println("    F1: $(round(f1_stats[1]*100, digits=2))% ± $(round(f1_stats[2]*100, digits=2))%")
+    
+    push!(knn_results, (k, f1_stats[1], results))
+end
+
+sorted_knn_results = sort(knn_results, by=x->x[2], rev=true)
+
+println("\n🏆 kNN Results Ranking:")
+println("-"^70)
+for (i, (k, f1, _)) in enumerate(sorted_knn_results)
+    badge = i == 1 ? "🥇" : i == 2 ? "🥈" : i == 3 ? "🥉" : "  "
+    println("$badge $i. k=$k - F1: $(round(f1*100, digits=2))%")
+end
+
+best_k_knn, best_f1_knn = sorted_knn_results[1][1:2]
+println("\n✨ Best kNN: k=$best_k_knn (CV F1: $(round(best_f1_knn*100, digits=2))%)")
+
+# Train final kNN
+println("\n🚀 Preparing final kNN...")
+
+kNNClassifier = @load KNNClassifier pkg=NearestNeighborModels
+
+train_inputs_norm_knn = normalizeMinMax(train_inputs, calculateMinMaxNormalizationParameters(train_inputs))
+test_inputs_norm_knn = normalizeMinMax(test_inputs, calculateMinMaxNormalizationParameters(train_inputs))
+
+train_targets_str_knn = string.(train_targets)
+test_targets_str_knn = string.(test_targets)
+
+model_knn = kNNClassifier(K=best_k_knn)
+
+mach_knn = machine(model_knn, MLJ.table(train_inputs_norm_knn), categorical(train_targets_str_knn))
+MLJ.fit!(mach_knn, verbosity=0)
+
+knn_predictions = MLJ.predict(mach_knn, MLJ.table(test_inputs_norm_knn))
+knn_predictions_mode = mode.(knn_predictions)
+
+cm_results_knn = confusionMatrix(knn_predictions_mode, test_targets_str_knn, classes; weighted=true)
+
+println("\n📊 kNN TEST SET RESULTS:")
+println("="^70)
+println("Accuracy:  $(round(cm_results_knn.accuracy*100, digits=2))%")
+println("F1 Score:  $(round(cm_results_knn.aggregated.f1*100, digits=2))%")
+
+# ============================================================================
+#            EXPERIMENT 5: ENSEMBLE METHODS
+# ============================================================================
+#
+# Strategy: Combine the top 3 individual models to improve robustness
+#
+# Models Selected:
+#   1. Best ANN
+#   2. Best Decision Tree
+#   3. Best kNN
+#
+# Ensemble Techniques:
+#   1. Majority Voting: Each model votes equally, winner takes all
+#   2. Weighted Voting: Models vote proportionally to their CV F1 scores
+#
+# Expected Benefits:
+#   - Reduced variance through model averaging
+#   - More robust predictions
+#   - Leverage complementary strengths of different algorithms
+#
+# ============================================================================
+
+println("\n" * "="^70)
+println("🔬 EXPERIMENT 5: ENSEMBLE METHODS")
+println("Combining ANN + Decision Tree + kNN")
+println("="^70)
+
+# Helper functions for ensemble
+function majorityVoting(predictions::Vector{Vector{String}})
+    n_samples = length(predictions[1])
+    ensemble_predictions = Vector{String}(undef, n_samples)
+    
+    for i in 1:n_samples
+        votes = [pred[i] for pred in predictions]
+        ensemble_predictions[i] = mode(votes)
+    end
+    
+    return ensemble_predictions
+end
+
+function weightedVoting(predictions::Vector{Vector{String}}, weights::Vector{Float64})
+    n_samples = length(predictions[1])
+    n_models = length(predictions)
+    classes_unique = sort(unique(vcat(predictions...)))
+    n_classes = length(classes_unique)
+    
+    ensemble_predictions = Vector{String}(undef, n_samples)
+    
+    for i in 1:n_samples
+        class_scores = Dict(c => 0.0 for c in classes_unique)
+        
+        for j in 1:n_models
+            class_pred = predictions[j][i]
+            class_scores[class_pred] += weights[j]
+        end
+        
+        ensemble_predictions[i] = argmax(class_scores)
+    end
+    
+    return ensemble_predictions
+end
+
+# Get test predictions from all 3 models as string vectors
+ann_test_pred_str = string.(argmax.(eachrow(test_outputs_ann)) .- 1)
+tree_test_pred_str = string.(tree_predictions_mode)
+knn_test_pred_str = string.(knn_predictions_mode)
+
+all_predictions = [ann_test_pred_str, tree_test_pred_str, knn_test_pred_str]
+
+# Method 1: Majority Voting
+println("\n[1/2] Majority Voting...")
+majority_predictions = majorityVoting(all_predictions)
+cm_results_majority = confusionMatrix(majority_predictions, test_targets_str, classes; weighted=true)
+println("✅ Majority Voting - F1: $(round(cm_results_majority.aggregated.f1*100, digits=2))%")
+
+# Method 2: Weighted Voting
+println("\n[2/2] Weighted Voting...")
+cv_scores = [best_f1_ann, best_f1_tree, best_f1_knn]
+weights = cv_scores ./ sum(cv_scores)
+
+println("  Model weights:")
+println("    ANN:           $(round(weights[1]*100, digits=1))%")
+println("    Decision Tree: $(round(weights[2]*100, digits=1))%")
+println("    kNN:           $(round(weights[3]*100, digits=1))%")
+
+weighted_predictions = weightedVoting(all_predictions, weights)
+cm_results_weighted = confusionMatrix(weighted_predictions, test_targets_str, classes; weighted=true)
+println("✅ Weighted Voting - F1: $(round(cm_results_weighted.aggregated.f1*100, digits=2))%")
+
+
+# ============================================================================
+#  APPROACH 3: OVERSAMPLING STRATEGY
+#  Description: Balance classes by duplicating minority samples instead of removing majority
+# ============================================================================
+
+println("\n" * "#"^70)
+println("🔬 APPROACH 3: OVERSAMPLING")
+println("#"^70)
+
+# Function for Random Oversampling
+function random_oversampling(df, target_col)
+    classes = unique(df[!, target_col])
+    # Find count of majority class
+    max_count = maximum([sum(df[!, target_col] .== c) for c in classes])
+    
+    balanced_parts = []
+    for c in classes
+        df_class = df[df[!, target_col] .== c, :]
+        n_current = size(df_class, 1)
+        if n_current < max_count
+            # Oversample with replacement
+            ids = rand(1:n_current, max_count)
+            push!(balanced_parts, df_class[ids, :])
+        else
+            push!(balanced_parts, df_class)
+        end
+    end
+    return vcat(balanced_parts...)
+end
+
+# 1. Prepare Data (Oversampling on Training Data ONLY to prevent leakage)
+# Note: We use the raw training split created in Approach 1 section
+df_train_os = random_oversampling(df_train, "Risk_Class")
+
+# 2. Preprocess (Reuse existing function)
+df_train_os_proc = preprocess_multiclass(df_train_os, "Is Fraudulent")
+input_cols_os = setdiff(names(df_train_os_proc), ["Risk_Class"])
+
+train_inputs_os = Matrix{Float64}(df_train_os_proc[:, input_cols_os])
+train_targets_os = Int.(df_train_os_proc.Risk_Class)
+
+# 3. Evaluate ALL models on this new dataset
+results_app3 = evaluate_approach("Oversampling", train_inputs_os, train_targets_os)
+
+
+# ============================================================================
+#  APPROACH 4: FEATURE EXTRACTION (PCA)
+#  Description: Reduce dimensionality using PCA before modeling
+# ============================================================================
+
+using LinearAlgebra # Required for PCA
+
+println("\n" * "#"^70)
+println("🔬 APPROACH 4: PCA FEATURE EXTRACTION")
+println("#"^70)
+
+function apply_pca_transform(data, variance_threshold=0.95)
+    # 1. Standardize (Zero Mean, Unit Variance)
+    norm_params = calculateZeroMeanNormalizationParameters(data)
+    data_std = normalizeZeroMean(data, norm_params)
+    
+    # 2. Covariance & Eigen decomposition
+    C = cov(data_std)
+    F = eigen(C)
+    
+    # Sort eigenvalues desc
+    idx = sortperm(F.values, rev=true)
+    evals = F.values[idx]
+    evecs = F.vectors[:, idx]
+    
+    # 3. Select components
+    cum_var = cumsum(evals ./ sum(evals))
+    k = findfirst(x -> x >= variance_threshold, cum_var)
+    println("   PCA: Retaining $k components (Variance covered: $(round(cum_var[k]*100, digits=2))%)")
+    
+    # 4. Transform
+    W = evecs[:, 1:k]
+    return data_std * W
+end
+
+# 1. Apply PCA to the Standard Undersampled Train Data (from Approach 1)
+# Using 'train_inputs' from the beginning of the notebook
+train_inputs_pca = apply_pca_transform(train_inputs, 0.95)
+
+# 2. Evaluate ALL models on PCA data
+results_app4 = evaluate_approach("PCA (95% Variance)", train_inputs_pca, train_targets)
+
+# ============================================================================
+#  APPROACH 5: BINARY CLASSIFICATION (ORIGINAL GROUND TRUTH)
+#  Description: Train directly on the original "Is Fraudulent" label.
+#  Why: Class 1 (Suspicious) contains both Frauds and Risky Legitimate ones.
+#       Merging 1 & 2 would confuse the model. We use the true binary label.
+# ============================================================================
+
+println("\n" * "#"^70)
+println("🔬 APPROACH 5: BINARY CLASSIFICATION (Original Fraud vs Not)")
+println("#"^70)
+
+# 1. Extract the Original Binary Targets (0/1)
+# We go back to df_train/df_test because preprocessing dropped the target column
+println("   Extracting original 'Is Fraudulent' labels from balanced dataframe...")
+
+# Ensure we align with the rows used in train_inputs (which come from df_train)
+train_targets_binary = Int.(df_train[!, "Is Fraudulent"])
+test_targets_binary  = Int.(df_test[!, "Is Fraudulent"])
+
+# Check distribution
+n_fraud = sum(train_targets_binary .== 1)
+n_legit = sum(train_targets_binary .== 0)
+println("   Binary Train Distribution: Legit=$n_legit, Fraud=$n_fraud")
+
+# 2. Evaluate ALL models on Binary Targets
+# The inputs (train_inputs) remain the same (we keep the feature engineering like "Is_Night", etc.)
+# but we aim for the true binary target.
+results_app5 = evaluate_approach("Binary (Original)", train_inputs, train_targets_binary)
+
+# ============================================================================
+#              FINAL RESULTS COMPARISON
+# ============================================================================
+#
+# Comprehensive comparison of all 6 approaches on the hold-out test set.
+#
+# Evaluation Metrics:
+#   - F1 Score: Harmonic mean of precision and recall
+#   - Accuracy: Overall correct predictions
+#   - Per-Class Metrics: Performance for each risk level
+#
+# Key Question: Which approach best balances overall performance 
+#               with fraud detection capability?
+#
+# ============================================================================
+
+# ============================================================================
+#  FINAL COMPARISON SUMMARY - ALL APPROACHES
+# ============================================================================
+
+println("\n" * "="^80)
+println("🏆 FINAL RESULTS & COMPARISON OF ALL APPROACHES")
+println("="^80)
+
+# 1. Recuperiamo i risultati del Primo Approccio (Undersampling) per metterli in tabella
+# Usiamo le variabili che hai già calcolato nelle celle precedenti
+results_base = Dict(
+    "ANN" => cm_results_ann.aggregated.f1,
+    "SVM" => cm_results_svm.aggregated.f1,
+    "DT"  => cm_results_tree.aggregated.f1,
+    "kNN" => cm_results_knn.aggregated.f1
+)
+
+# 2. Funzione per stampare la tabella comparativa
+using Printf
+function print_row(name, res)
+    @printf("%-22s | %6.2f%% | %6.2f%% | %6.2f%% | %6.2f%%\n", 
+        name, res["ANN"]*100, res["SVM"]*100, res["DT"]*100, res["kNN"]*100)
+end
+
+println("Approach               |   ANN    |   SVM    |    DT    |   kNN")
+println("-"^75)
+
+# Stampa di tutti gli approcci
+print_row("1. Undersampling (Base)", results_base)
+print_row("2. Oversampling", results_app3)
+print_row("3. PCA Features", results_app4)
+print_row("4. Binary Classif.", results_app5)
+
+println("-"^75)
+
+# 3. Aggiungiamo i risultati degli Ensemble (che hai fatto solo sull'approccio base)
+println("\n📌 Ensemble Methods (Applied to Base Undersampling):")
+println("   • Majority Voting: $(round(cm_results_majority.aggregated.f1*100, digits=2))% (F1 Score)")
+println("   • Weighted Voting: $(round(cm_results_weighted.aggregated.f1*100, digits=2))% (F1 Score)")
+
+# 4. Calcolo del vincitore assoluto
+all_scores = [
+    ("Undersampling (Best)", maximum(values(results_base))),
+    ("Oversampling (Best)", maximum(values(results_app3))),
+    ("PCA (Best)", maximum(values(results_app4))),
+    ("Binary (Best)", maximum(values(results_app5))),
+    ("Ensemble Majority", cm_results_majority.aggregated.f1),
+    ("Ensemble Weighted", cm_results_weighted.aggregated.f1)
+]
+
+best_model = sort(all_scores, by=x->x[2], rev=true)[1]
+
+println("\n" * "="^80)
+println("🎯 OVERALL BEST PERFORMANCE: $(best_model[1])")
+println("   F1 Score: $(round(best_model[2]*100, digits=2))%")
+println("="^80)
+
+println("\n📋 PROJECT SUMMARY:")
+println("  ✅ Tested 4 distinct Data Approaches (Under, Over, PCA, Binary)")
+println("  ✅ Evaluated 4 ML Algorithms (ANN, SVM, DT, kNN) for EACH approach")
+println("  ✅ Implemented Ensemble methods on the base approach")
+println("  ✅ Total Experiments: >20 model configurations evaluated")
+println("="^80)

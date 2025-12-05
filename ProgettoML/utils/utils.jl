@@ -1186,10 +1186,6 @@ end
 #     MODEL CROSS-VALIDATION (Extended for Project - Multiclass Support)
 # ============================================================================
 
-# Note: This function extends the course utilities to support
-# SVMs, Decision Trees, and kNN using MLJ, following the same
-# pattern as the original modelCrossValidation function.
-
 # Load MLJ models
 using MLJ
 using LIBSVM
@@ -1201,12 +1197,14 @@ function modelCrossValidation(
         modelType::Symbol, 
         modelHyperparameters::Dict,
         dataset::Tuple{AbstractArray{<:Real,2}, AbstractArray{Int,1}},
-        crossValidationIndices::Array{Int64,1})
+        crossValidationIndices::Array{Int64,1};
+        normalize::Bool=true)  # <--- NUOVO PARAMETRO
 
     inputs, targets = dataset
 
     # --- Handle ANN case ---
     if modelType == :ANN
+        # L'ANN gestisce la normalizzazione esternamente o internamente come prima
         topology = get(modelHyperparameters, "topology", [5, 3])
         learningRate = get(modelHyperparameters, "learningRate", 0.003)
         validationRatio = get(modelHyperparameters, "validationRatio", 0.1)
@@ -1250,10 +1248,15 @@ function modelCrossValidation(
         Xtest = inputs[testIndices, :]
         ytest = targets_str[testIndices]
 
-        # Normalize
-        normParams = calculateMinMaxNormalizationParameters(Xtrain)
-        Xtrain_norm = normalizeMinMax(Xtrain, normParams)
-        Xtest_norm = normalizeMinMax(Xtest, normParams)
+        # --- FIX PUNTO 2: Normalizzazione Condizionale ---
+        if normalize
+            normParams = calculateMinMaxNormalizationParameters(Xtrain)
+            Xtrain_ready = normalizeMinMax(Xtrain, normParams)
+            Xtest_ready = normalizeMinMax(Xtest, normParams)
+        else
+            Xtrain_ready = Xtrain
+            Xtest_ready = Xtest
+        end
 
         # Create model
         local model
@@ -1267,7 +1270,8 @@ function modelCrossValidation(
                 cost=Float64(get(modelHyperparameters, "C", 1.0)),
                 gamma=Float64(get(modelHyperparameters, "gamma", 0.125)),
                 degree=Int32(get(modelHyperparameters, "degree", 3)),
-                coef0=Float64(get(modelHyperparameters, "coef0", 0.0))
+                coef0=Float64(get(modelHyperparameters, "coef0", 0.0)),
+                probability=true  # <--- FIX PUNTO 3: Abilita probabilità per AUC
             )
         elseif modelType == :DecisionTreeClassifier
             model = DTClassifier(
@@ -1281,17 +1285,24 @@ function modelCrossValidation(
         end
 
         # Fit & Predict
-        mach = machine(model, MLJ.table(Xtrain_norm), categorical(ytrain))
+        mach = machine(model, MLJ.table(Xtrain_ready), categorical(ytrain))
         MLJ.fit!(mach, verbosity=0)
-        predictions_raw = MLJ.predict(mach, MLJ.table(Xtest_norm))
         
-        # Get predictions
-        ŷ = modelType == :SVC ? predictions_raw : mode.(predictions_raw)
+        # Predict 
+        if modelType == :SVC
+            # SVM ora supporta predict probabilistico se probability=true, ma per coerenza
+            # usiamo predict (label) per la matrice di confusione.
+            # (Per l'AUC servirebbe predict_mode o predict scikit-style, ma qui calcoliamo metriche hard)
+            predictions_raw = MLJ.predict(mach, MLJ.table(Xtest_ready))
+            ŷ = predictions_raw # SVM restituisce label dirette (Categorical)
+        else
+            predictions_prob = MLJ.predict(mach, MLJ.table(Xtest_ready))
+            ŷ = mode.(predictions_prob)
+        end
         
-        # --- METRIC CALCULATION (Fixing the Binary/Multiclass Crash) ---
+        # --- METRIC CALCULATION ---
         if numClasses == 2
-            # BINARY CASE: Convert to boolean vectors and use binary CM
-            # Assuming the "positive" class is the second one or "1"
+            # BINARY CASE
             pos_label = classes[2] 
             y_pred_bool = ŷ .== pos_label
             y_true_bool = ytest .== pos_label
@@ -1307,7 +1318,7 @@ function modelCrossValidation(
             f1s[k] = f1
             globalConfusionMatrix .+= cm
         else
-            # MULTICLASS CASE: Use the weighted CM
+            # MULTICLASS CASE
             cm_results = confusionMatrix(ŷ, ytest, classes; weighted=true)
             
             accuracies[k] = cm_results.accuracy

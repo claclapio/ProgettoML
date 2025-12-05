@@ -74,98 +74,113 @@ end
 function preprocess_multiclass(dataframe, target_col::String="Is Fraudulent"; stats=nothing)
     """
     Preprocess dataframe for multiclass fraud detection.
-    
-    Argomenti:
-        - dataframe: Il dataset da processare
-        - target_col: Nome della colonna target
-        - stats: (Opzionale) Dizionario con le statistiche calcolate sul training set.
-                 Se nothing, vengono calcolate sui dati correnti (modalità Training).
-    
-    Ritorna:
-        - Se stats è nothing: (processed_data, calculated_stats)
-        - Se stats è fornito: processed_data
+    SAFE VERSION + CYCLICAL TIME:
+    - No Leakage.
+    - Orario ciclico (Seno/Coseno) per gestire la continuità 23:00 -> 00:00.
     """
     data = copy(dataframe)
     
-    # Se stats è nothing, siamo in fase di training: dobbiamo calcolare le statistiche
+    # Determina se siamo in fase di training o test
     is_training = isnothing(stats)
     new_stats = is_training ? Dict{String, Any}() : stats
     
-    # 1. Time features (Nessuna statistica necessaria)
+    # ========================================================================
+    # 1. TIME FEATURES (Cicliche)
+    # ========================================================================
     if "Transaction Date" in names(data)
         try
             parsed_dates = DateTime.(data[!, "Transaction Date"], dateformat"y-m-d H:M:S")
-            data.Transaction_Hour = hour.(parsed_dates)
-            data.Is_Night = [h < 6 ? 1.0 : 0.0 for h in data.Transaction_Hour]
+            
+            # Estraiamo l'ora grezza (0-23)
+            raw_hours = hour.(parsed_dates)
+            
+            # TRASFORMAZIONE CICLICA:
+            # Mappa le 24 ore su un cerchio unitario.
+            # Questo permette al modello di capire che le 23:00 sono vicine alle 00:00.
+            data.Hour_Sin = sin.(2 * π * raw_hours ./ 24.0)
+            data.Hour_Cos = cos.(2 * π * raw_hours ./ 24.0)
+            
+            # Giorno della settimana (1-7)
+            data.Transaction_DayOfWeek = dayofweek.(parsed_dates)
+            
         catch e
             println("  ⚠ Error processing dates: $e")
+            data.Hour_Sin = zeros(Float64, size(data, 1))
+            data.Hour_Cos = zeros(Float64, size(data, 1))
+            data.Transaction_DayOfWeek = zeros(Int, size(data, 1))
         end
     end
     
-    # 2. Imputation (Median)
-    # Calcoliamo la mediana SOLO sul train e la riusiamo sul test
-    for col in ["Transaction Amount", "Account Age Days"]
+    # ========================================================================
+    # 2. IMPUTATION (Gestione Valori Mancanti)
+    # ========================================================================
+    cols_to_impute = ["Transaction Amount", "Account Age Days", "Customer Age", "Quantity"]
+    
+    for col in cols_to_impute
         if col in names(data)
-            # Determina il valore da usare
             val_to_use = 0.0
-            
             if is_training
-                # Modo Train: Calcola e salva
                 val_to_use = median(skipmissing(data[!, col]))
                 new_stats[col * "_median"] = val_to_use
             else
-                # Modo Test: Usa valore salvato (se esiste, altrimenti ricalcola fallback)
-                if haskey(new_stats, col * "_median")
-                    val_to_use = new_stats[col * "_median"]
-                else
-                    val_to_use = median(skipmissing(data[!, col])) # Fallback
-                end
+                val_to_use = get(new_stats, col * "_median", 0.0)
             end
             
-            # Applica imputazione
             if any(ismissing, data[!, col])
                 replace!(data[!, col], missing => val_to_use)
             end
         end
     end
     
-    # 3. Feature engineering
+    # ========================================================================
+    # 3. FEATURE ENGINEERING (Numeriche)
+    # ========================================================================
     if "Transaction Amount" in names(data) && "Account Age Days" in names(data)
         data.Amount_per_AccountAge = data[!, "Transaction Amount"] ./ (data[!, "Account Age Days"] .+ 1.0)
     end
     
-    # High_Value_Flag (95th percentile)
-    # CRITICO: Il quantile deve essere calcolato SOLO sul train
-    if "Transaction Amount" in names(data)
-        p95 = 0.0
-        
-        if is_training
-            p95 = quantile(data[!, "Transaction Amount"], 0.95)
-            new_stats["amount_p95"] = p95
-        else
-            if haskey(new_stats, "amount_p95")
-                p95 = new_stats["amount_p95"]
+    # ========================================================================
+    # 4. ONE-HOT ENCODING (Categoriche)
+    # ========================================================================
+    cols_to_encode = ["Payment Method", "Device Used", "Product Category"]
+    
+    for col in cols_to_encode
+        if col in names(data)
+            cats = String[]
+            if is_training
+                cats = sort(unique(data[!, col]))
+                new_stats[col * "_cats"] = cats
             else
-                p95 = quantile(data[!, "Transaction Amount"], 0.95)
+                cats = get(new_stats, col * "_cats", String[])
+            end
+            
+            for cat in cats
+                clean_cat = replace(string(cat), " " => "_", "&" => "and", "." => "")
+                new_col_name = "$(col)_$(clean_cat)"
+                data[!, new_col_name] = [x == cat ? 1.0 : 0.0 for x in data[!, col]]
             end
         end
+    end
+
+    # ========================================================================
+    # 5. CLEANUP
+    # ========================================================================
+    cols_to_drop = [
+        "Transaction ID", "Customer ID", "Transaction Date", 
+        "IP Address", "Shipping Address", "Billing Address", "Customer Location",
+        "Payment Method", "Product Category", "Device Used",
         
-        data.High_Value_Flag = [amt > p95 ? 1.0 : 0.0 for amt in data[!, "Transaction Amount"]]
-    end
+        # RIMUOVIAMO l'ora grezza (usiamo Sin/Cos)
+        "Transaction_Hour", 
+        
+        # LEAKAGE DA RIMUOVERE
+        target_col, "Hour_Risk", "Amount_Risk", "Account_Risk", "Total_Risk",
+        "Is_Night", "High_Value_Flag", "New_Account_Flag"
+    ]
     
-    if "Account Age Days" in names(data)
-        data.New_Account_Flag = [age < 30 ? 1.0 : 0.0 for age in data[!, "Account Age Days"]]
-    end
+    existing_cols_to_drop = intersect(names(data), cols_to_drop)
+    select!(data, Not(existing_cols_to_drop))
     
-    # Drop unnecessary columns
-    cols_to_drop = ["Transaction ID", "Customer ID", "Transaction Date", 
-                    "IP Address", "Shipping Address", "Billing Address", "Customer Location",
-                    "Quantity", "Customer Age", "Payment Method", "Product Category",
-                    target_col, "Hour_Risk", "Amount_Risk", "Account_Risk", "Total_Risk",
-                    "Device Used"]
-    select!(data, Not(intersect(names(data), cols_to_drop)))
-    
-    # Ritorna i dati. Se eravamo in training, ritorna anche le statistiche.
     if is_training
         return data, new_stats
     else

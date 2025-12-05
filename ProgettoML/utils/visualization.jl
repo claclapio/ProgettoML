@@ -32,7 +32,7 @@ function plot_confusion_matrix(cm, classes; title="Confusion Matrix")
     # savefig("cm_$(title).png")
 end
 
-function plot_model_comparison_boxplot(model_names, f1_scores_list)
+function plot_model_comparison(model_names, f1_scores_list)
     # f1_scores_list deve essere un vettore di vettori (es. [ann_f1s, svm_f1s, ...])
     # StatsPlots boxplot accetta (x, y) dove x sono le categorie
     
